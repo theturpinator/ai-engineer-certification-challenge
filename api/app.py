@@ -1,9 +1,10 @@
 """Ask MustangDriver chat API.
 
-FastAPI app: POST /chat streams SSE tokens + a citations event from a
-LangGraph ReAct agent with one tool (search_archive over an in-memory Qdrant
-collection built from index_artifact/ at startup). Conversation history keyed
-by user_id via the Postgres checkpointer (docker compose, repo root).
+FastAPI app: POST /chat streams SSE tokens + tool/citations events from a
+LangGraph ReAct agent with three tools: search_archive (in-memory Qdrant over
+index_artifact/, built at startup), web_search (Tavily, live web), and
+check_recalls (NHTSA Recalls API). Conversation history keyed by user_id via
+the Postgres checkpointer (docker compose, repo root).
 
 Run locally:  uv run uvicorn app:app --port 8000
 """
@@ -13,6 +14,7 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
 import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -37,10 +39,19 @@ TOP_K = 5
 SYSTEM_PROMPT = """You are the Ask MustangDriver assistant, an enthusiastic and \
 knowledgeable guide to the MustangDriver.com article archive.
 
-Answer questions using the search_archive tool and ground every answer in the \
-retrieved articles. Cite your sources inline as markdown links using each \
-article's title and URL, e.g. [Article Title](https://www.mustangdriver.com/...). \
-If the archive doesn't cover a topic, say so plainly rather than guessing."""
+Tool policy:
+- search_archive first for Mustang history, specs, builds, reviews, and lore. \
+Ground those answers in the retrieved articles and cite sources inline as \
+markdown links using each article's title and URL, e.g. \
+[Article Title](https://www.mustangdriver.com/...).
+- web_search only when the archive comes up empty or the question is \
+inherently live (current prices, market values, news, upcoming events, \
+availability). Any answer built on web results MUST begin with "According to \
+a live web search" and cite the source pages.
+- check_recalls for safety-recall questions; report the official NHTSA \
+campaigns (component, summary, remedy, date), or that none were found.
+
+If no tool can answer, say so plainly rather than guessing."""
 
 _embeddings = OpenAIEmbeddings(
     model="openai/text-embedding-3-small",
@@ -82,6 +93,52 @@ async def search_archive(query: str) -> str:
     )
 
 
+@tool
+async def web_search(query: str) -> str:
+    """Search the live web (Tavily) for current information the archive can't
+    answer: prices, market values, news, events, availability. Returns a JSON
+    list of results, each with title, url, and content snippet."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": os.environ["TAVILY_API_KEY"],
+                "query": query,
+                "max_results": 5,
+            },
+            timeout=30,
+        )
+    resp.raise_for_status()
+    return json.dumps(
+        [{"title": r["title"], "url": r["url"], "content": r["content"]}
+         for r in resp.json()["results"]],
+        ensure_ascii=False,
+    )
+
+
+@tool
+async def check_recalls(year: int, make: str = "Ford", model: str = "Mustang") -> str:
+    """Look up official NHTSA safety recalls for a vehicle model year
+    (defaults to Ford Mustang). Returns a JSON list of recall campaigns with
+    component, summary, remedy, and report date, or a no-recalls message."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://api.nhtsa.gov/recalls/recallsByVehicle",
+            params={"make": make, "model": model, "modelYear": year},
+            timeout=30,
+        )
+    resp.raise_for_status()
+    results = resp.json().get("results", [])
+    if not results:
+        return f"No NHTSA recalls found for the {year} {make} {model}."
+    return json.dumps(
+        [{"campaign": r["NHTSACampaignNumber"], "date": r["ReportReceivedDate"],
+          "component": r["Component"], "summary": r["Summary"], "remedy": r["Remedy"]}
+         for r in results],
+        ensure_ascii=False,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _qdrant, _agent
@@ -94,7 +151,7 @@ async def lifespan(app: FastAPI):
                 base_url=GATEWAY_URL,
                 api_key=os.environ["AI_GATEWAY_API_KEY"],
             ),
-            [search_archive],
+            [search_archive, web_search, check_recalls],
             prompt=SYSTEM_PROMPT,
             checkpointer=saver,
         )
@@ -126,11 +183,13 @@ async def chat(req: ChatRequest):
             stream_mode="messages",
         )
         async for msg, _meta in stream:
-            if isinstance(msg, ToolMessage) and msg.name == "search_archive":
-                for hit in json.loads(msg.content):
-                    if hit["url"] not in seen:
-                        seen.add(hit["url"])
-                        citations.append({"title": hit["title"], "url": hit["url"]})
+            if isinstance(msg, ToolMessage):
+                yield f"data: {json.dumps({'type': 'tool', 'name': msg.name})}\n\n"
+                if msg.name == "search_archive":
+                    for hit in json.loads(msg.content):
+                        if hit["url"] not in seen:
+                            seen.add(hit["url"])
+                            citations.append({"title": hit["title"], "url": hit["url"]})
             elif isinstance(msg, AIMessageChunk) and isinstance(msg.content, str) and msg.content:
                 yield f"data: {json.dumps({'type': 'token', 'text': msg.content})}\n\n"
         yield f"data: {json.dumps({'type': 'citations', 'citations': citations})}\n\n"

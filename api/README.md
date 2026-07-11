@@ -23,10 +23,12 @@ uv run uvicorn app:app --port 8000
 
 - `GET /health` → `{"status": "ok"}`
 - `POST /chat` with JSON `{"message": str, "user_id": str}` → SSE stream:
-  1. `data: {"type": "token", "text": "..."}` — one event per token as the model generates
-  2. `data: {"type": "citations", "citations": [{"title": "...", "url": "..."}]}` — the
+  1. `data: {"type": "tool", "name": "search_archive" | "web_search" | "check_recalls"}` —
+     one event per tool call the agent makes (may be interleaved with tokens; zero or more)
+  2. `data: {"type": "token", "text": "..."}` — one event per token as the model generates
+  3. `data: {"type": "citations", "citations": [{"title": "...", "url": "..."}]}` — the
      articles actually retrieved this turn (empty list if no retrieval)
-  3. `data: [DONE]`
+  4. `data: [DONE]`
 
 `user_id` is the LangGraph thread id: turns with the same user_id share
 conversation history via the Postgres checkpointer.
