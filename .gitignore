@@ -19,3 +19,7 @@ node_modules/
 
 # OS
 .DS_Store
+
+# but the eval datasets are committed
+!evals/data/
+evals/data/kg.json

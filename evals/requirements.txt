@@ -1,0 +1,10 @@
+# ragas 0.2.x needs the langchain 0.3 line (0.4+/1.x removed modules ragas imports)
+ragas==0.2.15
+langchain-openai<0.4
+langchain-community<0.4
+langsmith
+qdrant-client
+numpy
+python-dotenv
+pandas
+rapidfuzz
