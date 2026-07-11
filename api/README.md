@@ -10,6 +10,27 @@ uv venv
 uv pip install -r requirements.txt
 ```
 
+## Running the chat API
+
+Needs the repo-root `.env` (AI_GATEWAY_API_KEY, DATABASE_URL, LANGSMITH_*)
+and the local Postgres from the repo-root compose file:
+
+```sh
+docker compose up -d          # from the repo root (Postgres on host port 5433)
+cd api
+uv run uvicorn app:app --port 8000
+```
+
+- `GET /health` → `{"status": "ok"}`
+- `POST /chat` with JSON `{"message": str, "user_id": str}` → SSE stream:
+  1. `data: {"type": "token", "text": "..."}` — one event per token as the model generates
+  2. `data: {"type": "citations", "citations": [{"title": "...", "url": "..."}]}` — the
+     articles actually retrieved this turn (empty list if no retrieval)
+  3. `data: [DONE]`
+
+`user_id` is the LangGraph thread id: turns with the same user_id share
+conversation history via the Postgres checkpointer.
+
 ## Ingestion
 
 Turns `../data/articles-clean.csv` (gitignored) into the committed index

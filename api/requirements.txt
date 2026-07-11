@@ -1,3 +1,13 @@
 numpy
 python-dotenv
 tiktoken
+fastapi
+uvicorn
+langgraph
+langgraph-checkpoint-postgres
+langchain-openai
+qdrant-client
+psycopg[binary]
+httpx
+pytest
+pytest-asyncio
