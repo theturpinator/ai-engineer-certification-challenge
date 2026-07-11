@@ -224,7 +224,7 @@ Near-term engineering improvements, straight from this write-up's honest caveats
 
 Product items deliberately deferred out of the certification scope (see [issue #1](https://github.com/theturpinator/ai-engineer-certification-challenge/issues/1)) that form the Demo Day roadmap:
 
-- **Garage as a destination:** arcade-style stat scores (Power/Handling/etc.), stat-boost estimates for proposed mods, and car visuals — turning My Garage from a memory readout into the reason users return.
+- **Garage as a destination — largely SHIPPED post-spec** as the increment documented in [issue #13](https://github.com/theturpinator/ai-engineer-certification-challenge/issues/13) (2026-07-11): the garage now holds multiple cars (chat-driven car targeting, legacy profiles migrate), each with Need-for-Speed-style 0–100 stat bars plus real stock figures (LLM-generated once per car and cached), an AI-generated car portrait (gpt-image-1 via the gateway, cached server-side, regenerated when identity/color changes), a car switcher, and inline editing (PATCH/DELETE endpoints) — chat remains the primary input; forms are an override for correcting what the assistant learned. Still open from this item: stat-boost estimates for proposed mods.
 - **Partner-vendor product sourcing** and vendor-restricted search, so mod suggestions can link to real parts — the publisher-side monetization story.
 - **Live Webflow CMS sync** replacing the CSV snapshot, so new articles enter the index as they're published.
 - **Accounts / cross-device identity** — localStorage UUID is zero-friction but device-bound; an optional lightweight login would carry the garage between phone and laptop.

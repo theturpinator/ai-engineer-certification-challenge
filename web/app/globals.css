@@ -59,6 +59,7 @@ header nav a {
   border-radius: 12px;
   padding: 10px 14px;
   margin: 0;
+  overflow-wrap: break-word; /* long mod names / URLs wrap instead of clipping */
 }
 
 .card h2 {
@@ -157,4 +158,230 @@ button {
 
 button:disabled {
   opacity: 0.5;
+}
+
+/* --- Garage 2.0: car tabs, portrait, stat bars, inline editing --- */
+
+.cartabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cartabs button {
+  background: #22252c;
+  color: #e8e6e3;
+  border: 1px solid #363b45;
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.cartabs button.active {
+  background: #d94f30;
+  border-color: #d94f30;
+  color: #fff;
+}
+
+.carhead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.carhead h2 {
+  flex: 1;
+}
+
+.editbtn {
+  background: none;
+  border: 1px solid #363b45;
+  color: #9096a1;
+  border-radius: 8px;
+  padding: 2px 10px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.carmeta {
+  color: #9096a1;
+  font-size: 0.9em;
+  margin: 0;
+}
+
+.portraitbox {
+  margin: 8px 0 10px;
+}
+
+.portrait {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 10px;
+  background: #1d2026;
+}
+
+.portrait.placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #9096a1;
+  font-size: 0.85rem;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+.figures {
+  color: #ffa04d;
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  margin: 0 0 8px;
+}
+
+.stats {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.stat {
+  display: grid;
+  grid-template-columns: 88px 1fr 34px;
+  gap: 10px;
+  align-items: center;
+}
+
+.stat .label {
+  color: #9096a1;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.stat .bar {
+  height: 10px;
+  border-radius: 5px;
+  background: #1d2026;
+  overflow: hidden;
+}
+
+.stat .bar > div {
+  height: 100%;
+  border-radius: 5px;
+  background: linear-gradient(90deg, #d94f30, #ffa04d);
+}
+
+.stat .num {
+  text-align: right;
+  font-weight: 700;
+  color: #ffa04d;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85rem;
+}
+
+.editform {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.editgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.editgrid label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0; /* grid items ignore the input's intrinsic width */
+}
+
+.editgrid input {
+  width: 100%;
+}
+
+.fieldlabel {
+  color: #9096a1;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.chipedit {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: #1d2026;
+  border: 1px solid #363b45;
+  border-radius: 999px;
+  padding: 2px 6px 2px 12px;
+  font-size: 0.85rem;
+}
+
+.chip button {
+  background: none;
+  border: none;
+  color: #9096a1;
+  padding: 0 4px;
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.chipadd {
+  display: flex;
+  gap: 8px;
+}
+
+.chipadd input {
+  padding: 6px 10px;
+  font-size: 14px;
+}
+
+.chipadd button,
+.editactions button {
+  padding: 6px 14px;
+  font-size: 14px;
+  border-radius: 8px;
+}
+
+.editactions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.editactions .secondary {
+  background: #22252c;
+  border: 1px solid #363b45;
+  color: #e8e6e3;
+}
+
+.formerr {
+  color: #ff7a66;
+  font-size: 0.85rem;
+  margin: 0;
 }

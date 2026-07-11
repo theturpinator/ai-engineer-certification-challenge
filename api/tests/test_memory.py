@@ -33,12 +33,16 @@ async def test_car_extraction_lands_in_garage():
             )
 
             profile = (await client.get(f"/garage/{user_id}")).json()["profile"]
-            assert int(profile["year"]) == 2016, profile
-            assert "gt" in str(profile["trim"]).lower(), profile
-            assert "s550" in str(profile["generation"]).lower(), profile
-            assert profile.get("mods"), profile
-            assert profile.get("wishlist"), profile
-            assert profile.get("goals"), profile
+            cars = profile.get("cars") or []
+            assert len(cars) == 1, profile
+            car = cars[0]
+            assert car["id"], car
+            assert int(car["year"]) == 2016, car
+            assert "gt" in str(car["trim"]).lower(), car
+            assert "s550" in str(car["generation"]).lower(), car
+            assert car.get("mods"), car
+            assert car.get("wishlist"), car
+            assert profile.get("goals"), profile  # goals stay user-level
 
 
 @pytest.mark.asyncio

@@ -4,30 +4,40 @@ FastAPI app: POST /chat streams SSE tokens + tool/citations events from a
 LangGraph ReAct agent with three tools: search_archive (in-memory Qdrant over
 index_artifact/, built at startup), web_search (Tavily, live web), and
 check_recalls (NHTSA Recalls API), plus two memory tools: update_garage
-(semantic: the user's car, mods, wishlist, goals) and update_instructions
-(procedural: standing answer preferences), both keyed by user_id in Postgres
-and folded into the system prompt each turn. Episodic memory: after each turn
-a background task has Claude Haiku keep a rolling 2-3 sentence summary of the
-session (keyed by user_id + session_id from the client), and recent past-session
-summaries are injected into the system prompt. GET /garage/{user_id} returns
-everything known. Conversation history keyed by user_id via the Postgres
-checkpointer (docker compose, repo root).
+(semantic: the user's cars, per-car mods/wishlist, user-level goals) and
+update_instructions (procedural: standing answer preferences), both keyed by
+user_id in Postgres and folded into the system prompt each turn. Episodic
+memory: after each turn a background task has Claude Haiku keep a rolling 2-3
+sentence summary of the session (keyed by user_id + session_id from the
+client), and recent past-session summaries are injected into the system
+prompt. The garage holds multiple cars (profile.cars, legacy flat profiles
+migrate on read); each car is enriched in the background with arcade-style
+stock stats (Sonnet, cached in the car) and an AI-generated portrait
+(gpt-image-1 via the gateway, cached in car_images). GET /garage/{user_id}
+returns everything known; cars are editable via PATCH/DELETE
+/garage/{user_id}/cars/{car_id}. Conversation history keyed by user_id via
+the Postgres checkpointer (docker compose, repo root).
 
 Run locally:  uv run uvicorn app:app --port 8000
 """
 
+import asyncio
+import base64
 import json
 import os
+import re
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Annotated
 
 import httpx
 import numpy as np
 import psycopg
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 from langchain_core.messages import AIMessageChunk, ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -36,7 +46,7 @@ from psycopg.types.json import Json
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.prebuilt import create_react_agent
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StringConstraints
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 
@@ -65,10 +75,15 @@ campaigns (component, summary, remedy, date), or that none were found.
 If no tool can answer, say so plainly rather than guessing.
 
 Memory policy:
-- Whenever the user mentions facts about their own car — model year, trim, \
-generation (e.g. S550), installed mods, wishlist/planned mods, or goals for \
-the car (track, show, daily driver) — silently call update_garage with those \
-facts. Never announce or mention that you recorded anything.
+- Whenever the user mentions facts about one of their own cars — model year, \
+trim, generation (e.g. S550), color, nickname, installed mods, \
+wishlist/planned mods, or goals (track, show, daily driver) — silently call \
+update_garage with those facts. The garage holds multiple cars: pass the \
+`car` argument with the user's own words for which car they mean (e.g. \
+"my 2016 GT", "the Fox-body"). When the user mentions a car of theirs that \
+is NOT yet in their garage profile, record it as a new garage entry by \
+calling update_garage with its facts. Never announce or mention that you \
+recorded anything.
 - Whenever the user states a standing preference about how you should answer \
 (e.g. "keep answers short", "always end with X"), silently call \
 update_instructions with that preference, then follow it.
@@ -83,6 +98,12 @@ _embeddings = OpenAIEmbeddings(
 
 _summarizer = ChatOpenAI(
     model="anthropic/claude-haiku-4.5",
+    base_url=GATEWAY_URL,
+    api_key=os.environ["AI_GATEWAY_API_KEY"],
+)
+
+_stats_llm = ChatOpenAI(
+    model="anthropic/claude-sonnet-4.5",
     base_url=GATEWAY_URL,
     api_key=os.environ["AI_GATEWAY_API_KEY"],
 )
@@ -173,14 +194,93 @@ async def _db() -> psycopg.AsyncConnection:
     )
 
 
+LEGACY_CAR_FIELDS = ("year", "trim", "generation", "mods", "wishlist")
+CAR_MATCH_FIELDS = ("year", "trim", "generation", "nickname", "color")
+
+
+def _migrate(profile: dict) -> dict:
+    """Wrap legacy flat single-car fields into cars[0] (in place); idempotent."""
+    if any(k in profile for k in LEGACY_CAR_FIELDS):
+        car = {"id": uuid.uuid4().hex[:8]}
+        for k in LEGACY_CAR_FIELDS:
+            if k in profile:
+                car[k] = profile.pop(k)
+        profile["cars"] = [car] + profile.get("cars", [])
+    return profile
+
+
+def _car_tokens(*values) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", " ".join(str(v) for v in values).lower()))
+
+
+def _conflicts(car: dict, updates: dict) -> bool:
+    """True when updates name a different car (an identity field disagrees)."""
+    for k in ("year", "trim", "generation"):
+        if updates.get(k) and car.get(k):
+            a, b = str(updates[k]).lower(), str(car[k]).lower()
+            if a != b if k == "year" else (a not in b and b not in a):
+                return True
+    return False
+
+
+def _match_car(cars: list[dict], desc: str | None, updates: dict) -> dict | None:
+    """The existing car a garage update targets, or None to create a new one.
+
+    Order: exact id match on `desc`; fuzzy token overlap of `desc` against each
+    car's identity fields; identity fields in the updates themselves; a lone
+    car when nothing disagrees. Identifying info that matches nothing => None
+    (the caller creates a new car)."""
+    if desc:
+        for c in cars:
+            if c.get("id") == desc:
+                return c
+        want = _car_tokens(desc)
+        score, best = max(
+            ((len(want & _car_tokens(*(c.get(k, "") for k in CAR_MATCH_FIELDS))), c)
+             for c in cars),
+            default=(0, None), key=lambda t: t[0],
+        )
+        return best if best is not None and score > 0 and not _conflicts(best, updates) else None
+    for c in cars:
+        agree = any(
+            updates.get(k) and c.get(k)
+            and (str(updates[k]) == str(c[k]) if k == "year"
+                 else str(updates[k]).lower() in str(c[k]).lower()
+                 or str(c[k]).lower() in str(updates[k]).lower())
+            for k in ("year", "trim", "generation")
+        )
+        if agree and not _conflicts(c, updates):
+            return c
+    if len(cars) == 1 and not _conflicts(cars[0], updates):
+        return cars[0]
+    if any(updates.get(k) for k in ("year", "trim", "generation")):
+        return None  # identifying info matching no car -> new entry
+    return cars[0] if cars else None  # ponytail: ambiguous target defaults to first car
+
+
+async def _load_profile(conn, user_id: str) -> dict:
+    """Garage profile, migrated to the cars[] shape. A legacy flat profile is
+    written back once so the migrated car id is stable across reads."""
+    row = await (
+        await conn.execute("SELECT profile FROM garage WHERE user_id = %s", (user_id,))
+    ).fetchone()
+    raw = row[0] if row else {}
+    profile = _migrate(dict(raw))
+    if profile != raw:
+        await conn.execute(
+            "INSERT INTO garage (user_id, profile) VALUES (%s, %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET profile = EXCLUDED.profile",
+            (user_id, Json(profile)),
+        )
+    return profile
+
+
 async def _get_memory(user_id: str) -> tuple[dict, list[str], list[dict]]:
     """(garage profile, standing instructions, recent session summaries) for a
     user; empty when unknown. Summaries are recent-first, with session_id so
     /chat can exclude the session in progress (limit 6 = 5 past + current)."""
     async with await _db() as conn:
-        row = await (
-            await conn.execute("SELECT profile FROM garage WHERE user_id = %s", (user_id,))
-        ).fetchone()
+        profile = await _load_profile(conn, user_id)
         rows = await (
             await conn.execute(
                 "SELECT instruction FROM instructions WHERE user_id = %s ORDER BY id",
@@ -197,7 +297,7 @@ async def _get_memory(user_id: str) -> tuple[dict, list[str], list[dict]]:
     summaries = [
         {"session_id": r[0], "summary": r[1], "date": str(r[2].date())} for r in srows
     ]
-    return (row[0] if row else {}), [r[0] for r in rows], summaries
+    return profile, [r[0] for r in rows], summaries
 
 
 async def _summarize(user_id: str, session_id: str, user_text: str, parts: list[str]):
@@ -235,39 +335,166 @@ async def _summarize(user_id: str, session_id: str, user_text: str, parts: list[
         print(f"session summary failed: {e}")
 
 
+def _car_desc(car: dict) -> str:
+    """'2016 S550 GT Premium' — identity fields only, in a natural order."""
+    return " ".join(str(car[k]) for k in ("year", "generation", "trim") if car.get(k))
+
+
+STATS_PROMPT = """You are a Ford Mustang encyclopedia. For the completely STOCK \
+{desc} Ford Mustang (factory condition, no modifications), reply with ONLY this \
+JSON object, no other text:
+{{"power": <0-100>, "acceleration": <0-100>, "top_speed": <0-100>, \
+"handling": <0-100>, "braking": <0-100>, "hp": <stock horsepower, integer>, \
+"zero_to_sixty": <stock 0-60 mph time in seconds, float>, \
+"top_speed_mph": <stock top speed in mph, integer>}}
+The 0-100 values are arcade-racing-game ratings calibrated across the entire \
+Mustang range, 1964 to today: a 1974 Mustang II is roughly 15-25 power, a base \
+1990s V6 around 30-40, a 2015+ GT around 75-85, a 2020 Shelby GT500 is 95-100."""
+
+
+async def _generate_stats(car: dict) -> dict | None:
+    desc = _car_desc(car)
+    if not desc:
+        return None
+    resp = await _stats_llm.ainvoke(STATS_PROMPT.format(desc=desc))
+    m = re.search(r"\{.*\}", resp.content, re.S)
+    return json.loads(m.group()) if m else None
+
+
+def _image_prompt(car: dict) -> str:
+    color = car.get("color") or "a factory paint color appropriate to that generation"
+    return (
+        f"Photorealistic studio photograph, full side profile, of a {_car_desc(car)} "
+        f"Ford Mustang in {color}. Body style exactly accurate for that model year "
+        "and generation. Dark seamless studio background, soft reflective floor, "
+        "dramatic rim lighting. No people, no text, no watermarks."
+    )
+
+
+async def _generate_image(user_id: str, car: dict) -> None:
+    """Generate + cache the car portrait unless the cached one was made from
+    the same prompt (the prompt doubles as the identity/color fingerprint)."""
+    prompt = _image_prompt(car)
+    async with await _db() as conn:
+        row = await (
+            await conn.execute(
+                "SELECT prompt FROM car_images WHERE user_id = %s AND car_id = %s",
+                (user_id, car["id"]),
+            )
+        ).fetchone()
+    if row and row[0] == prompt:
+        return
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{GATEWAY_URL}/images/generations",
+            headers={"Authorization": f"Bearer {os.environ['AI_GATEWAY_API_KEY']}"},
+            json={"model": "openai/gpt-image-1", "prompt": prompt,
+                  "size": "1024x1024", "quality": "low"},
+            timeout=300,
+        )
+    resp.raise_for_status()
+    image = base64.b64decode(resp.json()["data"][0]["b64_json"])
+    async with await _db() as conn:
+        await conn.execute(
+            "INSERT INTO car_images (user_id, car_id, image, prompt) "
+            "VALUES (%s, %s, %s, %s) ON CONFLICT (user_id, car_id) DO UPDATE "
+            "SET image = EXCLUDED.image, prompt = EXCLUDED.prompt",
+            (user_id, car["id"], image, prompt),
+        )
+
+
+async def _save_car_stats(user_id: str, car_id: str, stats: dict) -> None:
+    """Re-read-modify-write so a concurrent chat turn's garage write between
+    enrichment start and finish isn't clobbered."""
+    async with await _db() as conn:
+        profile = await _load_profile(conn, user_id)
+        for c in profile.get("cars", []):
+            if c["id"] == car_id and not c.get("stats"):
+                c["stats"] = stats
+                await conn.execute(
+                    "UPDATE garage SET profile = %s WHERE user_id = %s",
+                    (Json(profile), user_id),
+                )
+                return
+
+
+_enriching: set[str] = set()  # ponytail: in-process dedupe; a queue if multi-worker
+
+
+async def _enrich_garage(user_id: str) -> None:
+    """Background: fill in missing stats and missing/stale portraits for every
+    identified car. Cheap no-op when everything is already current."""
+    if user_id in _enriching:
+        return
+    _enriching.add(user_id)
+    try:
+        async with await _db() as conn:
+            profile = await _load_profile(conn, user_id)
+        for car in profile.get("cars", []):
+            if not _car_desc(car):
+                continue  # nothing identifying to draw or rate yet
+            if not car.get("stats"):
+                stats = await _generate_stats(car)
+                if stats:
+                    await _save_car_stats(user_id, car["id"], stats)
+            await _generate_image(user_id, car)
+    except Exception as e:  # ponytail: enrichment is best-effort, next request retries
+        print(f"garage enrichment failed for {user_id}: {e}")
+    finally:
+        _enriching.discard(user_id)
+
+
 @tool
 async def update_garage(
     config: RunnableConfig,
+    car: str | None = None,
     year: int | None = None,
     trim: str | None = None,
     generation: str | None = None,
+    color: str | None = None,
+    nickname: str | None = None,
     mods: list[str] | None = None,
     wishlist: list[str] | None = None,
     goals: list[str] | None = None,
 ) -> str:
-    """Record facts the user reveals about their own Mustang: model year, trim
-    (e.g. GT Premium), generation (e.g. S550), installed mods, wishlist/planned
-    mods, and goals (track, show, daily driver). All arguments optional; new
-    values merge into the existing profile."""
+    """Record facts the user reveals about their own Mustang(s). The garage
+    holds multiple cars. Pass `car` with the user's own words for which car
+    they mean (e.g. "my 2016 GT", "the Fox-body") whenever they own more than
+    one or mention a car not yet in their garage — an unknown car automatically
+    becomes a new garage entry. Per-car facts: model year, trim (e.g. GT
+    Premium), generation (e.g. S550), color, nickname, installed mods, and
+    wishlist/planned mods. goals (track, show, daily driver) apply to the user
+    as a whole. All arguments optional; new values merge into the existing
+    profile."""
     user_id = config["configurable"]["user_id"]
     updates = {
         k: v
         for k, v in dict(year=year, trim=trim, generation=generation,
-                         mods=mods, wishlist=wishlist, goals=goals).items()
+                         color=color, nickname=nickname,
+                         mods=mods, wishlist=wishlist).items()
         if v is not None
     }
     async with await _db() as conn:
         # ponytail: read-merge-write, no row lock; fine for one-user-per-thread chat
-        row = await (
-            await conn.execute("SELECT profile FROM garage WHERE user_id = %s", (user_id,))
-        ).fetchone()
-        profile = row[0] if row else {}
-        for k, v in updates.items():
-            if isinstance(v, list):
-                current = profile.get(k, [])
-                profile[k] = current + [x for x in v if x not in current]
-            else:
-                profile[k] = v
+        profile = await _load_profile(conn, user_id)
+        cars = profile.setdefault("cars", [])
+        if updates or car:
+            target = _match_car(cars, car, updates)
+            if target is None:
+                target = {"id": uuid.uuid4().hex[:8]}
+                cars.append(target)
+            if any(str(target.get(k)) != str(updates[k])
+                   for k in ("year", "trim", "generation") if k in updates):
+                target["stats"] = None  # identity changed -> stats stale
+            for k, v in updates.items():
+                if isinstance(v, list):
+                    current = target.get(k, [])
+                    target[k] = current + [x for x in v if x not in current]
+                else:
+                    target[k] = v
+        if goals:
+            current = profile.get("goals", [])
+            profile["goals"] = current + [g for g in goals if g not in current]
         await conn.execute(
             "INSERT INTO garage (user_id, profile) VALUES (%s, %s) "
             "ON CONFLICT (user_id) DO UPDATE SET profile = EXCLUDED.profile",
@@ -321,6 +548,12 @@ async def lifespan(app: FastAPI):
                 "updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
                 "PRIMARY KEY (user_id, session_id))"
             )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS car_images ("
+                "user_id TEXT NOT NULL, car_id TEXT NOT NULL, "
+                "image BYTEA NOT NULL, prompt TEXT NOT NULL, "
+                "PRIMARY KEY (user_id, car_id))"
+            )
         _agent = create_react_agent(
             ChatOpenAI(
                 model="anthropic/claude-sonnet-4.5",
@@ -353,6 +586,10 @@ async def health():
 @app.get("/garage/{user_id}")
 async def garage(user_id: str):
     profile, instructions, summaries = await _get_memory(user_id)
+    if profile.get("cars"):
+        # opportunistic fire-and-forget: fills stats/portraits missed earlier;
+        # _enrich_garage no-ops cheaply when everything is current
+        asyncio.get_running_loop().create_task(_enrich_garage(user_id))
     return {
         "profile": profile,
         "instructions": instructions,
@@ -360,12 +597,98 @@ async def garage(user_id: str):
     }
 
 
+@app.get("/garage/{user_id}/cars/{car_id}/image")
+async def car_image(user_id: str, car_id: str):
+    async with await _db() as conn:
+        row = await (
+            await conn.execute(
+                "SELECT image FROM car_images WHERE user_id = %s AND car_id = %s",
+                (user_id, car_id),
+            )
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "portrait not generated yet")
+    return Response(
+        content=bytes(row[0]),
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+Str80 = Annotated[str, StringConstraints(strip_whitespace=True, max_length=80)]
+Item = Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)]
+
+
+class CarPatch(BaseModel):
+    """UI edits; None clears a scalar field, lists replace wholesale."""
+    year: int | None = Field(None, ge=1964, le=2027)
+    trim: Str80 | None = None
+    generation: Str80 | None = None
+    color: Str80 | None = None
+    nickname: Str80 | None = None
+    mods: list[Item] | None = Field(None, max_length=50)
+    wishlist: list[Item] | None = Field(None, max_length=50)
+
+
+@app.patch("/garage/{user_id}/cars/{car_id}")
+async def patch_car(user_id: str, car_id: str, patch: CarPatch,
+                    background_tasks: BackgroundTasks):
+    updates = patch.model_dump(exclude_unset=True)
+    async with await _db() as conn:
+        profile = await _load_profile(conn, user_id)
+        target = next((c for c in profile.get("cars", []) if c["id"] == car_id), None)
+        if target is None:
+            raise HTTPException(404, "car not found")
+        if any(str(target.get(k)) != str(updates[k])
+               for k in ("year", "trim", "generation") if k in updates):
+            target["stats"] = None  # identity changed -> regenerate
+        for k, v in updates.items():
+            if v is None:
+                target.pop(k, None)
+            else:
+                target[k] = v
+        await conn.execute(
+            "UPDATE garage SET profile = %s WHERE user_id = %s",
+            (Json(profile), user_id),
+        )
+    background_tasks.add_task(_enrich_garage, user_id)
+    return target
+
+
+@app.delete("/garage/{user_id}/cars/{car_id}", status_code=204)
+async def delete_car(user_id: str, car_id: str):
+    async with await _db() as conn:
+        profile = await _load_profile(conn, user_id)
+        cars = profile.get("cars", [])
+        if not any(c["id"] == car_id for c in cars):
+            raise HTTPException(404, "car not found")
+        profile["cars"] = [c for c in cars if c["id"] != car_id]
+        await conn.execute(
+            "UPDATE garage SET profile = %s WHERE user_id = %s",
+            (Json(profile), user_id),
+        )
+        await conn.execute(
+            "DELETE FROM car_images WHERE user_id = %s AND car_id = %s",
+            (user_id, car_id),
+        )
+
+
+async def _post_turn(user_id: str, session_id: str, user_text: str, parts: list[str]):
+    """After the SSE stream: update the session summary, then fill in any
+    missing car stats/portraits the turn's garage writes created."""
+    await _summarize(user_id, session_id, user_text, parts)
+    await _enrich_garage(user_id)
+
+
 @app.post("/chat")
 async def chat(req: ChatRequest):
     profile, instructions, summaries = await _get_memory(req.user_id)
     system = SYSTEM_PROMPT
     if profile:
-        system += f"\n\nThe user's garage profile (their car):\n{json.dumps(profile)}"
+        lean = {**profile, "cars": [  # stats are UI data, not prompt data
+            {k: v for k, v in c.items() if k != "stats"} for c in profile.get("cars", [])
+        ]} if profile.get("cars") else profile
+        system += f"\n\nThe user's garage profile (their cars):\n{json.dumps(lean)}"
     if instructions:
         system += "\n\nStanding user instructions (follow in every answer):\n" + "\n".join(
             f"- {i}" for i in instructions
@@ -407,6 +730,6 @@ async def chat(req: ChatRequest):
         sse(),
         media_type="text/event-stream",
         background=BackgroundTask(
-            _summarize, req.user_id, req.session_id, req.message, answer_parts
+            _post_turn, req.user_id, req.session_id, req.message, answer_parts
         ),
     )
