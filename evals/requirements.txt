@@ -8,3 +8,8 @@ numpy
 python-dotenv
 pandas
 rapidfuzz
+rank_bm25
+tabulate
+# notebook execution (experiments.ipynb)
+nbconvert
+ipykernel

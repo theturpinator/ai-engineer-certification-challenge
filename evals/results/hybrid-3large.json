@@ -1,0 +1,47 @@
+{
+  "judge": "openai/gpt-5-mini",
+  "config": {
+    "retriever": "hybrid",
+    "top_k": 5,
+    "embedding_model": "openai/text-embedding-3-large"
+  },
+  "synthetic": {
+    "experiment": "hybrid-3large-synthetic-f949d089",
+    "url": "https://smith.langchain.com/o/bf16fd47-1b69-572d-9217-aa83daeeb380/projects/p/2c802905-aa01-46e4-842b-49092b3822c5",
+    "samples": 51,
+    "metrics": {
+      "faithfulness": {
+        "mean": 0.9278,
+        "scored": 51,
+        "failed": 0
+      },
+      "answer_relevancy": {
+        "mean": 0.6508,
+        "scored": 51,
+        "failed": 0
+      },
+      "context_precision": {
+        "mean": 0.7955,
+        "scored": 51,
+        "failed": 0
+      },
+      "context_recall": {
+        "mean": 0.6893,
+        "scored": 51,
+        "failed": 0
+      }
+    }
+  },
+  "golden": {
+    "experiment": "hybrid-3large-golden-8921816a",
+    "url": "https://smith.langchain.com/o/bf16fd47-1b69-572d-9217-aa83daeeb380/projects/p/a4b2dd07-d12d-48dc-938b-a42fb0d05a54",
+    "samples": 10,
+    "metrics": {
+      "answer_correctness": {
+        "mean": 0.6316,
+        "scored": 10,
+        "failed": 0
+      }
+    }
+  }
+}

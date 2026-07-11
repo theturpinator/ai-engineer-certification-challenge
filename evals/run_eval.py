@@ -97,7 +97,16 @@ def load_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in open(path)]
 
 
-async def run(experiment: str, only: str | None):
+async def run(
+    experiment: str,
+    only: str | None = None,
+    pipeline_config: dict | None = None,
+    out_name: str = "baseline",
+) -> dict:
+    """Full eval harness for one pipeline variant: both datasets, all metrics,
+    LangSmith experiments prefixed `{experiment}-…`, aggregates saved to
+    results/{out_name}.json (same shape as baseline.json). Returns the report."""
+    pipeline_config = pipeline_config or {}
     client = Client()
 
     synthetic = [
@@ -111,7 +120,7 @@ async def run(experiment: str, only: str | None):
     ensure_dataset(client, SYNTHETIC_DS, synthetic)
     ensure_dataset(client, GOLDEN_DS, golden)
 
-    pipeline = RagPipeline()  # baseline dense config
+    pipeline = RagPipeline(**pipeline_config)
 
     async def target(inputs: dict) -> dict:
         contexts = await pipeline.retrieve(inputs["question"])
@@ -119,9 +128,14 @@ async def run(experiment: str, only: str | None):
         return {"answer": answer, "contexts": [c["text"] for c in contexts]}
 
     metrics = judge_metrics()
-    out = HERE / "results" / "baseline.json"
+    out = HERE / "results" / f"{out_name}.json"
     report = json.loads(out.read_text()) if out.exists() else {}  # --only reruns merge in
-    report.update({"judge": JUDGE_MODEL, "config": {"retriever": "dense", "top_k": pipeline.top_k}})
+    config = {
+        "retriever": pipeline.retriever,
+        "top_k": pipeline.top_k,
+        "embedding_model": pipeline_config.get("embedding_model", "openai/text-embedding-3-small"),
+    }
+    report.update({"judge": JUDGE_MODEL, "config": config})
 
     for dataset, metric_names, suffix in [
         (SYNTHETIC_DS, ["faithfulness", "answer_relevancy", "context_precision", "context_recall"], "synthetic"),
@@ -169,6 +183,7 @@ async def run(experiment: str, only: str | None):
     out.parent.mkdir(exist_ok=True)
     out.write_text(json.dumps(report, indent=2) + "\n")
     print(f"\nsaved {out}")
+    return report
 
 
 if __name__ == "__main__":
