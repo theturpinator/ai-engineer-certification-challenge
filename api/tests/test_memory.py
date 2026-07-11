@@ -22,7 +22,7 @@ async def test_car_extraction_lands_in_garage():
             # Unknown user: empty structures, not 404.
             resp = await client.get(f"/garage/{user_id}")
             assert resp.status_code == 200
-            assert resp.json() == {"profile": {}, "instructions": []}
+            assert resp.json() == {"profile": {}, "instructions": [], "summaries": []}
 
             await collect_events(
                 client,

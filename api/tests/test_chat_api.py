@@ -10,11 +10,12 @@ from httpx import ASGITransport, AsyncClient
 from app import app
 
 
-async def collect_events(client, message, user_id):
+async def collect_events(client, message, user_id, session_id=None):
     events = []
-    async with client.stream(
-        "POST", "/chat", json={"message": message, "user_id": user_id}, timeout=120
-    ) as resp:
+    body = {"message": message, "user_id": user_id}
+    if session_id:
+        body["session_id"] = session_id
+    async with client.stream("POST", "/chat", json=body, timeout=120) as resp:
         assert resp.status_code == 200
         async for line in resp.aiter_lines():
             if line.startswith("data: ") and line != "data: [DONE]":

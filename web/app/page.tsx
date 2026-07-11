@@ -17,6 +17,7 @@ export default function Chat() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const userId = useRef<string>("");
+  const sessionId = useRef<string>("");
   const loaded = useRef(false);
   const bottom = useRef<HTMLDivElement>(null);
 
@@ -27,6 +28,13 @@ export default function Chat() {
       localStorage.setItem("md_user_id", id);
     }
     userId.current = id;
+    // One session per visit: new per tab, survives refresh (sessionStorage).
+    let sid = sessionStorage.getItem("md_session_id");
+    if (!sid) {
+      sid = crypto.randomUUID();
+      sessionStorage.setItem("md_session_id", sid);
+    }
+    sessionId.current = sid;
     const saved = localStorage.getItem(`md_chat_${id}`);
     if (saved) setMessages(JSON.parse(saved));
     loaded.current = true;
@@ -51,7 +59,11 @@ export default function Chat() {
       const res = await fetch(`${API_URL}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, user_id: userId.current }),
+        body: JSON.stringify({
+          message: text,
+          user_id: userId.current,
+          session_id: sessionId.current,
+        }),
       });
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
 
