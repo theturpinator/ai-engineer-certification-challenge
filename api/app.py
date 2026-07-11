@@ -3,8 +3,12 @@
 FastAPI app: POST /chat streams SSE tokens + tool/citations events from a
 LangGraph ReAct agent with three tools: search_archive (in-memory Qdrant over
 index_artifact/, built at startup), web_search (Tavily, live web), and
-check_recalls (NHTSA Recalls API). Conversation history keyed by user_id via
-the Postgres checkpointer (docker compose, repo root).
+check_recalls (NHTSA Recalls API), plus two memory tools: update_garage
+(semantic: the user's car, mods, wishlist, goals) and update_instructions
+(procedural: standing answer preferences), both keyed by user_id in Postgres
+and folded into the system prompt each turn. GET /garage/{user_id} returns
+everything known. Conversation history keyed by user_id via the Postgres
+checkpointer (docker compose, repo root).
 
 Run locally:  uv run uvicorn app:app --port 8000
 """
@@ -16,12 +20,15 @@ from pathlib import Path
 
 import httpx
 import numpy as np
+import psycopg
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessageChunk, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
+from psycopg.types.json import Json
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.prebuilt import create_react_agent
@@ -51,7 +58,17 @@ a live web search" and cite the source pages.
 - check_recalls for safety-recall questions; report the official NHTSA \
 campaigns (component, summary, remedy, date), or that none were found.
 
-If no tool can answer, say so plainly rather than guessing."""
+If no tool can answer, say so plainly rather than guessing.
+
+Memory policy:
+- Whenever the user mentions facts about their own car — model year, trim, \
+generation (e.g. S550), installed mods, wishlist/planned mods, or goals for \
+the car (track, show, daily driver) — silently call update_garage with those \
+facts. Never announce or mention that you recorded anything.
+- Whenever the user states a standing preference about how you should answer \
+(e.g. "keep answers short", "always end with X"), silently call \
+update_instructions with that preference, then follow it.
+- Always follow every standing instruction listed below, in every answer."""
 
 _embeddings = OpenAIEmbeddings(
     model="openai/text-embedding-3-small",
@@ -139,20 +156,115 @@ async def check_recalls(year: int, make: str = "Ford", model: str = "Mustang") -
     )
 
 
+# ponytail: connection-per-call; pool if throughput ever matters
+async def _db() -> psycopg.AsyncConnection:
+    return await psycopg.AsyncConnection.connect(
+        os.environ["DATABASE_URL"], autocommit=True
+    )
+
+
+async def _get_memory(user_id: str) -> tuple[dict, list[str]]:
+    """(garage profile, standing instructions) for a user; empty when unknown."""
+    async with await _db() as conn:
+        row = await (
+            await conn.execute("SELECT profile FROM garage WHERE user_id = %s", (user_id,))
+        ).fetchone()
+        rows = await (
+            await conn.execute(
+                "SELECT instruction FROM instructions WHERE user_id = %s ORDER BY id",
+                (user_id,),
+            )
+        ).fetchall()
+    return (row[0] if row else {}), [r[0] for r in rows]
+
+
+@tool
+async def update_garage(
+    config: RunnableConfig,
+    year: int | None = None,
+    trim: str | None = None,
+    generation: str | None = None,
+    mods: list[str] | None = None,
+    wishlist: list[str] | None = None,
+    goals: list[str] | None = None,
+) -> str:
+    """Record facts the user reveals about their own Mustang: model year, trim
+    (e.g. GT Premium), generation (e.g. S550), installed mods, wishlist/planned
+    mods, and goals (track, show, daily driver). All arguments optional; new
+    values merge into the existing profile."""
+    user_id = config["configurable"]["user_id"]
+    updates = {
+        k: v
+        for k, v in dict(year=year, trim=trim, generation=generation,
+                         mods=mods, wishlist=wishlist, goals=goals).items()
+        if v is not None
+    }
+    async with await _db() as conn:
+        # ponytail: read-merge-write, no row lock; fine for one-user-per-thread chat
+        row = await (
+            await conn.execute("SELECT profile FROM garage WHERE user_id = %s", (user_id,))
+        ).fetchone()
+        profile = row[0] if row else {}
+        for k, v in updates.items():
+            if isinstance(v, list):
+                current = profile.get(k, [])
+                profile[k] = current + [x for x in v if x not in current]
+            else:
+                profile[k] = v
+        await conn.execute(
+            "INSERT INTO garage (user_id, profile) VALUES (%s, %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET profile = EXCLUDED.profile",
+            (user_id, Json(profile)),
+        )
+    return "Garage profile updated."
+
+
+@tool
+async def update_instructions(instruction: str, config: RunnableConfig) -> str:
+    """Record a standing preference about how the user wants answers (e.g.
+    "keep answers short", "explain like I'm a beginner"). Applied to every
+    future answer."""
+    user_id = config["configurable"]["user_id"]
+    async with await _db() as conn:
+        await conn.execute(
+            "INSERT INTO instructions (user_id, instruction) VALUES (%s, %s) "
+            "ON CONFLICT DO NOTHING",
+            (user_id, instruction),
+        )
+    return "Instruction saved."
+
+
+def _prompt(state, config: RunnableConfig):
+    """Per-turn system prompt: base persona + garage profile + instructions,
+    assembled in /chat and passed through config."""
+    system = config["configurable"].get("system_prompt", SYSTEM_PROMPT)
+    return [{"role": "system", "content": system}] + state["messages"]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _qdrant, _agent
     _qdrant = build_index()
     async with AsyncPostgresSaver.from_conn_string(os.environ["DATABASE_URL"]) as saver:
         await saver.setup()  # idempotent
+        async with await _db() as conn:  # idempotent memory tables
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS garage ("
+                "user_id TEXT PRIMARY KEY, profile JSONB NOT NULL DEFAULT '{}')"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS instructions ("
+                "id BIGSERIAL PRIMARY KEY, user_id TEXT NOT NULL, "
+                "instruction TEXT NOT NULL, UNIQUE (user_id, instruction))"
+            )
         _agent = create_react_agent(
             ChatOpenAI(
                 model="anthropic/claude-sonnet-4.5",
                 base_url=GATEWAY_URL,
                 api_key=os.environ["AI_GATEWAY_API_KEY"],
             ),
-            [search_archive, web_search, check_recalls],
-            prompt=SYSTEM_PROMPT,
+            [search_archive, web_search, check_recalls, update_garage, update_instructions],
+            prompt=_prompt,
             checkpointer=saver,
         )
         yield
@@ -173,13 +285,32 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/garage/{user_id}")
+async def garage(user_id: str):
+    profile, instructions = await _get_memory(user_id)
+    return {"profile": profile, "instructions": instructions}
+
+
 @app.post("/chat")
 async def chat(req: ChatRequest):
+    profile, instructions = await _get_memory(req.user_id)
+    system = SYSTEM_PROMPT
+    if profile:
+        system += f"\n\nThe user's garage profile (their car):\n{json.dumps(profile)}"
+    if instructions:
+        system += "\n\nStanding user instructions (follow in every answer):\n" + "\n".join(
+            f"- {i}" for i in instructions
+        )
+
     async def sse():
         citations, seen = [], set()
         stream = _agent.astream(
             {"messages": [{"role": "user", "content": req.message}]},
-            {"configurable": {"thread_id": req.user_id}},
+            {"configurable": {
+                "thread_id": req.user_id,
+                "user_id": req.user_id,
+                "system_prompt": system,
+            }},
             stream_mode="messages",
         )
         async for msg, _meta in stream:

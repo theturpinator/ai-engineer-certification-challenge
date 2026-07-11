@@ -30,8 +30,27 @@ uv run uvicorn app:app --port 8000
      articles actually retrieved this turn (empty list if no retrieval)
   4. `data: [DONE]`
 
+- `GET /garage/{user_id}` → `{"profile": {...}, "instructions": [...]}` —
+  everything remembered about a user (empty structures for unknown users, not 404).
+
 `user_id` is the LangGraph thread id: turns with the same user_id share
 conversation history via the Postgres checkpointer.
+
+## Memory
+
+Two agent tools write long-term memory to Postgres, keyed by `user_id`
+(the UUID is injected via config, never passed by the model):
+
+- `update_garage` — semantic memory: car year/trim/generation, installed
+  mods, wishlist, goals. Partial updates merge (lists append-dedupe,
+  scalars overwrite); stored as one jsonb row per user in the `garage` table.
+- `update_instructions` — procedural memory: standing answer preferences
+  ("keep answers short"), appended one row per instruction in the
+  `instructions` table.
+
+The system prompt is assembled per turn: base persona + routing policy +
+the user's garage profile + standing instructions, so writes from previous
+turns shape every answer.
 
 ## Ingestion
 
