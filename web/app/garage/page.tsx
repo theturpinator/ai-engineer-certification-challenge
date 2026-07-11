@@ -14,6 +14,7 @@ type Stats = {
   hp?: number;
   zero_to_sixty?: number;
   top_speed_mph?: number;
+  modified?: boolean;
 };
 type Car = {
   id: string;
@@ -136,6 +137,9 @@ function StatBars({ stats }: { stats: Stats }) {
           );
         })}
       </div>
+      {stats.modified && (
+        <p className="empty">Ratings reflect this car’s installed mods.</p>
+      )}
     </>
   );
 }

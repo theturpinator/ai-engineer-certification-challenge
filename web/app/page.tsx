@@ -8,18 +8,29 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 type Citation = { title: string; url: string };
 type Message = { role: "user" | "assistant"; content: string; citations?: Citation[] };
+type ChatMeta = { chat_id: string; title: string; updated_at: string };
 
 const NewTabLink = (props: React.ComponentProps<"a">) => (
   <a {...props} target="_blank" rel="noopener noreferrer" />
 );
 
+function ago(iso: string) {
+  const s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
 export default function Chat() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [chats, setChats] = useState<ChatMeta[]>([]);
+  const [drawer, setDrawer] = useState(false);
+  const [chatId, setChatId] = useState("");
   const userId = useRef<string>("");
   const sessionId = useRef<string>("");
-  const loaded = useRef(false);
   const bottom = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -36,17 +47,45 @@ export default function Chat() {
       sessionStorage.setItem("md_session_id", sid);
     }
     sessionId.current = sid;
-    const saved = localStorage.getItem(`md_chat_${id}`);
-    if (saved) setMessages(JSON.parse(saved));
-    loaded.current = true;
+    // "default" is the pre-multi-chat thread, so existing history shows up.
+    setChatId(localStorage.getItem("md_chat_id") || "default");
   }, []);
 
+  // The server transcript is the source of truth when (re)opening a chat.
   useEffect(() => {
-    if (loaded.current && userId.current) {
-      localStorage.setItem(`md_chat_${userId.current}`, JSON.stringify(messages));
-    }
+    if (!chatId || !userId.current) return;
+    fetch(`${API_URL}/chats/${userId.current}/${chatId}/messages`)
+      .then((r) => (r.ok ? r.json() : []))
+      .then(setMessages)
+      .catch(() => {});
+  }, [chatId]);
+
+  useEffect(() => {
     bottom.current?.scrollIntoView();
   }, [messages]);
+
+  function openDrawer() {
+    setDrawer(true);
+    fetch(`${API_URL}/chats/${userId.current}`)
+      .then((r) => (r.ok ? r.json() : []))
+      .then(setChats)
+      .catch(() => {});
+  }
+
+  function switchTo(id: string) {
+    setDrawer(false);
+    if (id === chatId) return;
+    localStorage.setItem("md_chat_id", id);
+    // A resumed or new chat is a fresh session for episodic memory.
+    sessionId.current = crypto.randomUUID();
+    sessionStorage.setItem("md_session_id", sessionId.current);
+    setMessages([]);
+    setChatId(id);
+  }
+
+  function newChat() {
+    switchTo(crypto.randomUUID().slice(0, 8));
+  }
 
   async function send(e: React.FormEvent) {
     e.preventDefault();
@@ -64,6 +103,7 @@ export default function Chat() {
           message: text,
           user_id: userId.current,
           session_id: sessionId.current,
+          chat_id: chatId || "default",
         }),
       });
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
@@ -109,7 +149,34 @@ export default function Chat() {
 
   return (
     <main>
+      {drawer && (
+        <div className="backdrop" onClick={() => setDrawer(false)}>
+          <aside className="drawer" onClick={(e) => e.stopPropagation()} aria-label="Chats">
+            <button type="button" className="newchat" onClick={newChat}>
+              + New chat
+            </button>
+            <ul className="chatlist">
+              {chats.map((c) => (
+                <li key={c.chat_id}>
+                  <button
+                    type="button"
+                    className={c.chat_id === chatId ? "active" : ""}
+                    onClick={() => switchTo(c.chat_id)}
+                  >
+                    <span className="title">{c.title}</span>
+                    <span className="time">{ago(c.updated_at)}</span>
+                  </button>
+                </li>
+              ))}
+              {chats.length === 0 && <li className="empty">No chats yet.</li>}
+            </ul>
+          </aside>
+        </div>
+      )}
       <header>
+        <button type="button" className="menubtn" aria-label="Chats" onClick={openDrawer}>
+          ☰
+        </button>
         Ask MustangDriver
         <nav>
           <Link href="/garage">My Garage</Link>

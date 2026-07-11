@@ -12,11 +12,17 @@ sentence summary of the session (keyed by user_id + session_id from the
 client), and recent past-session summaries are injected into the system
 prompt. The garage holds multiple cars (profile.cars, legacy flat profiles
 migrate on read); each car is enriched in the background with arcade-style
-stock stats (Sonnet, cached in the car) and an AI-generated portrait
-(gpt-image-1 via the gateway, cached in car_images). GET /garage/{user_id}
-returns everything known; cars are editable via PATCH/DELETE
-/garage/{user_id}/cars/{car_id}. Conversation history keyed by user_id via
-the Postgres checkpointer (docker compose, repo root).
+build-aware stats (Sonnet, cached in the car with a fingerprint) and an
+AI-generated portrait (gpt-image-1 via the gateway, cached in car_images with
+identity/build fingerprints). The portrait is canonical: identity changes
+(year/generation/trim) regenerate it; build changes (color/mods) EDIT the
+stored photo via gemini-2.5-flash-image, never re-rolling. GET
+/garage/{user_id} returns everything known; cars are editable via
+PATCH/DELETE /garage/{user_id}/cars/{car_id}. Users can hold multiple chats:
+POST /chat takes an optional chat_id (thread_id = user_id:chat_id, the legacy
+"default" chat keeps the bare user_id thread), GET /chats/{user_id} lists
+them, GET /chats/{user_id}/{chat_id}/messages replays a transcript from the
+Postgres checkpointer (docker compose, repo root).
 
 Run locally:  uv run uvicorn app:app --port 8000
 """
@@ -340,25 +346,73 @@ def _car_desc(car: dict) -> str:
     return " ".join(str(car[k]) for k in ("year", "generation", "trim") if car.get(k))
 
 
-STATS_PROMPT = """You are a Ford Mustang encyclopedia. For the completely STOCK \
-{desc} Ford Mustang (factory condition, no modifications), reply with ONLY this \
-JSON object, no other text:
+# --- Build fingerprints: what makes a portrait or stats block stale ---
+
+
+def _identity_fp(car: dict) -> str:
+    """Core identity (year/generation/trim). Mismatch => portrait regenerated."""
+    return _car_desc(car)
+
+
+def _build_fp(car: dict) -> str:
+    """Visual build (color + mods). Mismatch => stored portrait gets EDITED."""
+    return json.dumps({"color": str(car.get("color") or "").strip().lower(),
+                       "mods": sorted(car.get("mods") or [])})
+
+
+def _stats_fp(car: dict) -> str:
+    """Identity + mods (color doesn't move numbers). Mismatch => recompute."""
+    return json.dumps({"identity": _car_desc(car), "mods": sorted(car.get("mods") or [])})
+
+
+def _portrait_action(stored: tuple[str | None, str | None] | None, car: dict) -> str:
+    """'generate' | 'edit' | 'skip' for a car given the stored portrait's
+    (identity_fp, build_fp), or None when no portrait exists yet."""
+    if stored is None or stored[0] != _identity_fp(car):
+        return "generate"
+    if stored[1] != _build_fp(car):
+        return "edit"
+    return "skip"
+
+
+STATS_PROMPT = """You are a Ford Mustang encyclopedia. For the {desc} Ford \
+Mustang described below, reply with ONLY this JSON object, no other text:
 {{"power": <0-100>, "acceleration": <0-100>, "top_speed": <0-100>, \
 "handling": <0-100>, "braking": <0-100>, "hp": <stock horsepower, integer>, \
 "zero_to_sixty": <stock 0-60 mph time in seconds, float>, \
 "top_speed_mph": <stock top speed in mph, integer>}}
 The 0-100 values are arcade-racing-game ratings calibrated across the entire \
 Mustang range, 1964 to today: a 1974 Mustang II is roughly 15-25 power, a base \
-1990s V6 around 30-40, a 2015+ GT around 75-85, a 2020 Shelby GT500 is 95-100."""
+1990s V6 around 30-40, a 2015+ GT around 75-85, a 2020 Shelby GT500 is 95-100.
+{build_clause}
+hp, zero_to_sixty, and top_speed_mph must always be the STOCK factory figures \
+for this car, regardless of modifications."""
+
+STOCK_CLAUSE = "The car is completely stock (factory condition, no modifications); \
+rate it as such."
+MODDED_CLAUSE = """The car has these modifications installed: {mods}.
+The 0-100 ratings must reflect the CURRENT build: each modification moves the \
+ratings it affects up from the stock baseline (e.g. a supercharger raises power \
+and acceleration, a big brake kit raises braking, coilovers or sway bars raise \
+handling). Modifications that don't affect performance leave the ratings \
+unchanged."""
 
 
 async def _generate_stats(car: dict) -> dict | None:
     desc = _car_desc(car)
     if not desc:
         return None
-    resp = await _stats_llm.ainvoke(STATS_PROMPT.format(desc=desc))
+    mods = sorted(car.get("mods") or [])
+    clause = MODDED_CLAUSE.format(mods=", ".join(mods)) if mods else STOCK_CLAUSE
+    resp = await _stats_llm.ainvoke(STATS_PROMPT.format(desc=desc, build_clause=clause))
     m = re.search(r"\{.*\}", resp.content, re.S)
-    return json.loads(m.group()) if m else None
+    if not m:
+        return None
+    stats = json.loads(m.group())
+    stats["fp"] = _stats_fp(car)  # cache key: recompute only when this drifts
+    if mods:
+        stats["modified"] = True
+    return stats
 
 
 def _image_prompt(car: dict) -> str:
@@ -372,18 +426,9 @@ def _image_prompt(car: dict) -> str:
 
 
 async def _generate_image(user_id: str, car: dict) -> None:
-    """Generate + cache the car portrait unless the cached one was made from
-    the same prompt (the prompt doubles as the identity/color fingerprint)."""
+    """From-scratch portrait (gpt-image-1): only for a car with no portrait yet
+    or whose core identity changed. Stores both fingerprints alongside it."""
     prompt = _image_prompt(car)
-    async with await _db() as conn:
-        row = await (
-            await conn.execute(
-                "SELECT prompt FROM car_images WHERE user_id = %s AND car_id = %s",
-                (user_id, car["id"]),
-            )
-        ).fetchone()
-    if row and row[0] == prompt:
-        return
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{GATEWAY_URL}/images/generations",
@@ -396,20 +441,111 @@ async def _generate_image(user_id: str, car: dict) -> None:
     image = base64.b64decode(resp.json()["data"][0]["b64_json"])
     async with await _db() as conn:
         await conn.execute(
-            "INSERT INTO car_images (user_id, car_id, image, prompt) "
-            "VALUES (%s, %s, %s, %s) ON CONFLICT (user_id, car_id) DO UPDATE "
-            "SET image = EXCLUDED.image, prompt = EXCLUDED.prompt",
-            (user_id, car["id"], image, prompt),
+            "INSERT INTO car_images (user_id, car_id, image, prompt, identity_fp, build_fp) "
+            "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (user_id, car_id) DO UPDATE "
+            "SET image = EXCLUDED.image, prompt = EXCLUDED.prompt, "
+            "identity_fp = EXCLUDED.identity_fp, build_fp = EXCLUDED.build_fp",
+            (user_id, car["id"], image, prompt, _identity_fp(car), _build_fp(car)),
         )
+
+
+def _edit_prompt(old_build_fp: str, car: dict) -> str:
+    """Describe the DELTA between the stored portrait's build and the current
+    one (mods added/removed, color change) as a photo-edit instruction."""
+    old = json.loads(old_build_fp)
+    mods = sorted(car.get("mods") or [])
+    color = str(car.get("color") or "").strip().lower()
+    parts = []
+    color_changed = color != old.get("color", "")
+    if color_changed:
+        parts.append(f"repaint the car {car['color']}" if car.get("color")
+                     else "repaint the car in a factory color for this model")
+    added = [m for m in mods if m not in old.get("mods", [])]
+    removed = [m for m in old.get("mods", []) if m not in mods]
+    if added:
+        parts.append("represent these newly installed modifications where visible: "
+                     + ", ".join(added))
+    if removed:
+        parts.append("remove these modifications, restoring those areas to stock: "
+                     + ", ".join(removed))
+    keep = "angle, lighting, and background" if color_changed else \
+        "color, angle, lighting, and background"
+    return (
+        "Edit this photo: " + "; ".join(parts) + ". If a modification is not "
+        "externally visible, leave the photo unchanged in that respect. "
+        f"Keep the car, {keep} otherwise identical."
+    )
+
+
+async def _edit_image(user_id: str, car: dict, old_build_fp: str, image: bytes) -> None:
+    """Apply a build change as an EDIT to the stored portrait via
+    gemini-2.5-flash-image. On any failure the old portrait is kept."""
+    prompt = _edit_prompt(old_build_fp, car)
+    b64 = base64.b64encode(image).decode()
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{GATEWAY_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {os.environ['AI_GATEWAY_API_KEY']}"},
+            json={"model": "google/gemini-2.5-flash-image", "messages": [{
+                "role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                ]}]},
+            timeout=300,
+        )
+    resp.raise_for_status()
+    images = resp.json()["choices"][0]["message"].get("images") or []
+    if not images:  # keep the old portrait; a later build change retries
+        print(f"portrait edit returned no image for {user_id}/{car['id']}")
+        return
+    url = images[0]["image_url"]["url"]
+    edited = base64.b64decode(url.split("base64,", 1)[1])
+    async with await _db() as conn:
+        await conn.execute(
+            "UPDATE car_images SET image = %s, build_fp = %s "
+            "WHERE user_id = %s AND car_id = %s",
+            (edited, _build_fp(car), user_id, car["id"]),
+        )
+
+
+async def _sync_portrait(user_id: str, car: dict) -> None:
+    """Bring the stored portrait up to date with the car: generate from scratch
+    when missing or the identity changed, EDIT the stored photo when only the
+    build (color/mods) changed, otherwise leave the bytes untouched."""
+    async with await _db() as conn:
+        row = await (
+            await conn.execute(
+                "SELECT prompt, identity_fp, build_fp, image FROM car_images "
+                "WHERE user_id = %s AND car_id = %s",
+                (user_id, car["id"]),
+            )
+        ).fetchone()
+    if row and row[1] is None:  # pre-fingerprint row: adopt it, never re-roll
+        if row[0] == _image_prompt(car):
+            async with await _db() as conn:
+                await conn.execute(
+                    "UPDATE car_images SET identity_fp = %s, build_fp = %s "
+                    "WHERE user_id = %s AND car_id = %s",
+                    (_identity_fp(car), _build_fp(car), user_id, car["id"]),
+                )
+            return
+        row = None  # identity/color drifted while unfingerprinted -> regenerate
+    action = _portrait_action((row[1], row[2]) if row else None, car)
+    if action == "generate":
+        await _generate_image(user_id, car)
+    elif action == "edit":
+        await _edit_image(user_id, car, row[2], bytes(row[3]))
 
 
 async def _save_car_stats(user_id: str, car_id: str, stats: dict) -> None:
     """Re-read-modify-write so a concurrent chat turn's garage write between
-    enrichment start and finish isn't clobbered."""
+    enrichment start and finish isn't clobbered; the stats only land if the
+    build they were computed for is still the car's current build."""
     async with await _db() as conn:
         profile = await _load_profile(conn, user_id)
         for c in profile.get("cars", []):
-            if c["id"] == car_id and not c.get("stats"):
+            if c["id"] == car_id and _stats_fp(c) == stats.get("fp"):
                 c["stats"] = stats
                 await conn.execute(
                     "UPDATE garage SET profile = %s WHERE user_id = %s",
@@ -433,11 +569,12 @@ async def _enrich_garage(user_id: str) -> None:
         for car in profile.get("cars", []):
             if not _car_desc(car):
                 continue  # nothing identifying to draw or rate yet
-            if not car.get("stats"):
+            cached = car.get("stats")
+            if not cached or cached.get("fp") != _stats_fp(car):
                 stats = await _generate_stats(car)
                 if stats:
                     await _save_car_stats(user_id, car["id"], stats)
-            await _generate_image(user_id, car)
+            await _sync_portrait(user_id, car)
     except Exception as e:  # ponytail: enrichment is best-effort, next request retries
         print(f"garage enrichment failed for {user_id}: {e}")
     finally:
@@ -483,15 +620,14 @@ async def update_garage(
             if target is None:
                 target = {"id": uuid.uuid4().hex[:8]}
                 cars.append(target)
-            if any(str(target.get(k)) != str(updates[k])
-                   for k in ("year", "trim", "generation") if k in updates):
-                target["stats"] = None  # identity changed -> stats stale
             for k, v in updates.items():
                 if isinstance(v, list):
                     current = target.get(k, [])
                     target[k] = current + [x for x in v if x not in current]
                 else:
                     target[k] = v
+            if target.get("stats") and target["stats"].get("fp") != _stats_fp(target):
+                target["stats"] = None  # identity or mods changed -> recompute
         if goals:
             current = profile.get("goals", [])
             profile["goals"] = current + [g for g in goals if g not in current]
@@ -552,7 +688,22 @@ async def lifespan(app: FastAPI):
                 "CREATE TABLE IF NOT EXISTS car_images ("
                 "user_id TEXT NOT NULL, car_id TEXT NOT NULL, "
                 "image BYTEA NOT NULL, prompt TEXT NOT NULL, "
+                "identity_fp TEXT, build_fp TEXT, "
                 "PRIMARY KEY (user_id, car_id))"
+            )
+            await conn.execute(  # pre-2.1 installs lack the fingerprint columns
+                "ALTER TABLE car_images ADD COLUMN IF NOT EXISTS identity_fp TEXT"
+            )
+            await conn.execute(
+                "ALTER TABLE car_images ADD COLUMN IF NOT EXISTS build_fp TEXT"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS chats ("
+                "user_id TEXT NOT NULL, chat_id TEXT NOT NULL, "
+                "title TEXT NOT NULL, "
+                "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+                "updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+                "PRIMARY KEY (user_id, chat_id))"
             )
         _agent = create_react_agent(
             ChatOpenAI(
@@ -576,6 +727,22 @@ class ChatRequest(BaseModel):
     message: str
     user_id: str
     session_id: str = "default"  # old clients without one all share this bucket
+    chat_id: str = "default"  # the pre-multi-chat thread survives as "default"
+
+
+def _thread_id(user_id: str, chat_id: str) -> str:
+    """LangGraph thread per chat; "default" keeps the legacy bare-user_id
+    thread so pre-multi-chat history survives."""
+    return user_id if chat_id == "default" else f"{user_id}:{chat_id}"
+
+
+def _msg_text(msg) -> str:
+    """Plain text of a LangChain message; content blocks flattened."""
+    c = msg.content
+    if isinstance(c, list):
+        c = "".join(b.get("text", "") for b in c
+                    if isinstance(b, dict) and b.get("type") == "text")
+    return c if isinstance(c, str) else ""
 
 
 @app.get("/health")
@@ -639,14 +806,13 @@ async def patch_car(user_id: str, car_id: str, patch: CarPatch,
         target = next((c for c in profile.get("cars", []) if c["id"] == car_id), None)
         if target is None:
             raise HTTPException(404, "car not found")
-        if any(str(target.get(k)) != str(updates[k])
-               for k in ("year", "trim", "generation") if k in updates):
-            target["stats"] = None  # identity changed -> regenerate
         for k, v in updates.items():
             if v is None:
                 target.pop(k, None)
             else:
                 target[k] = v
+        if target.get("stats") and target["stats"].get("fp") != _stats_fp(target):
+            target["stats"] = None  # identity or mods changed -> recompute
         await conn.execute(
             "UPDATE garage SET profile = %s WHERE user_id = %s",
             (Json(profile), user_id),
@@ -673,6 +839,60 @@ async def delete_car(user_id: str, car_id: str):
         )
 
 
+@app.get("/chats/{user_id}")
+async def list_chats(user_id: str):
+    """The user's chats, recent-first. A legacy bare-user_id thread that has
+    checkpointer state but no chats row yet gets its row backfilled here."""
+    async with await _db() as conn:
+        rows = await (
+            await conn.execute(
+                "SELECT chat_id, title, updated_at FROM chats "
+                "WHERE user_id = %s ORDER BY updated_at DESC",
+                (user_id,),
+            )
+        ).fetchall()
+    chats = [{"chat_id": r[0], "title": r[1], "updated_at": r[2].isoformat()}
+             for r in rows]
+    if not any(c["chat_id"] == "default" for c in chats):
+        snap = await _agent.aget_state({"configurable": {"thread_id": user_id}})
+        msgs = (snap.values or {}).get("messages") if snap else None
+        if msgs:
+            title = next((_msg_text(m)[:60] for m in msgs
+                          if m.type == "human" and _msg_text(m)), "Earlier conversation")
+            async with await _db() as conn:
+                row = await (
+                    await conn.execute(
+                        "INSERT INTO chats (user_id, chat_id, title) "
+                        "VALUES (%s, 'default', %s) "
+                        "ON CONFLICT (user_id, chat_id) DO UPDATE SET title = chats.title "
+                        "RETURNING updated_at",
+                        (user_id, title),
+                    )
+                ).fetchone()
+            chats.append({"chat_id": "default", "title": title,
+                          "updated_at": row[0].isoformat()})
+    return chats
+
+
+@app.get("/chats/{user_id}/{chat_id}/messages")
+async def chat_messages(user_id: str, chat_id: str):
+    """The chat's transcript, reconstructed from the checkpointer: user and
+    assistant turns only (tool calls/results and empty AI messages skipped)."""
+    snap = await _agent.aget_state(
+        {"configurable": {"thread_id": _thread_id(user_id, chat_id)}}
+    )
+    out = []
+    for m in ((snap.values or {}).get("messages", []) if snap else []):
+        text = _msg_text(m)
+        if not text:
+            continue
+        if m.type == "human":
+            out.append({"role": "user", "content": text})
+        elif m.type == "ai":
+            out.append({"role": "assistant", "content": text})
+    return out
+
+
 async def _post_turn(user_id: str, session_id: str, user_text: str, parts: list[str]):
     """After the SSE stream: update the session summary, then fill in any
     missing car stats/portraits the turn's garage writes created."""
@@ -683,6 +903,12 @@ async def _post_turn(user_id: str, session_id: str, user_text: str, parts: list[
 @app.post("/chat")
 async def chat(req: ChatRequest):
     profile, instructions, summaries = await _get_memory(req.user_id)
+    async with await _db() as conn:  # title = first user message, then just bump
+        await conn.execute(
+            "INSERT INTO chats (user_id, chat_id, title) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id, chat_id) DO UPDATE SET updated_at = now()",
+            (req.user_id, req.chat_id, req.message[:60]),
+        )
     system = SYSTEM_PROMPT
     if profile:
         lean = {**profile, "cars": [  # stats are UI data, not prompt data
@@ -706,7 +932,7 @@ async def chat(req: ChatRequest):
         stream = _agent.astream(
             {"messages": [{"role": "user", "content": req.message}]},
             {"configurable": {
-                "thread_id": req.user_id,
+                "thread_id": _thread_id(req.user_id, req.chat_id),
                 "user_id": req.user_id,
                 "system_prompt": system,
             }},

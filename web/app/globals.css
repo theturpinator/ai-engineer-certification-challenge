@@ -160,6 +160,88 @@ button:disabled {
   opacity: 0.5;
 }
 
+/* --- Garage 2.1: chat drawer --- */
+
+.menubtn {
+  background: none;
+  border: none;
+  color: #e8e6e3;
+  font-size: 1.2rem;
+  line-height: 1;
+  padding: 0 8px 0 0;
+  cursor: pointer;
+}
+
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 20;
+}
+
+.drawer {
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: min(300px, 85vw);
+  background: #1d2026;
+  border-right: 1px solid #2b2f38;
+  z-index: 21;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+}
+
+.newchat {
+  width: 100%;
+}
+
+.chatlist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.chatlist button {
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: #e8e6e3;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-weight: 400;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  cursor: pointer;
+}
+
+.chatlist button:hover,
+.chatlist button.active {
+  background: #22252c;
+}
+
+.chatlist .title {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.9rem;
+}
+
+.chatlist .time {
+  color: #9096a1;
+  font-size: 0.75rem;
+}
+
 /* --- Garage 2.0: car tabs, portrait, stat bars, inline editing --- */
 
 .cartabs {
