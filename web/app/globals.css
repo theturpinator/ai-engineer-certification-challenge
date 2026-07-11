@@ -26,10 +26,59 @@ main {
 }
 
 header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
   padding: 12px 4px;
   border-bottom: 1px solid #2b2f38;
   font-weight: 700;
   color: #d94f30;
+}
+
+header nav {
+  margin-left: auto;
+  font-weight: 400;
+  font-size: 0.9em;
+}
+
+header nav a {
+  text-decoration: none;
+}
+
+.garage {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 0 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.card {
+  background: #22252c;
+  border-radius: 12px;
+  padding: 10px 14px;
+  margin: 0;
+}
+
+.card h2 {
+  margin: 0 0 4px;
+  font-size: 0.95rem;
+  color: #d94f30;
+}
+
+.card p,
+.card ul {
+  margin: 0;
+}
+
+.card ul {
+  padding-left: 18px;
+}
+
+.empty {
+  color: #9096a1;
+  font-size: 0.9em;
 }
 
 .messages {

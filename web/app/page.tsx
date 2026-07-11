@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import ReactMarkdown from "react-markdown";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -108,7 +109,12 @@ export default function Chat() {
 
   return (
     <main>
-      <header>Ask MustangDriver</header>
+      <header>
+        Ask MustangDriver
+        <nav>
+          <Link href="/garage">My Garage</Link>
+        </nav>
+      </header>
       <div className="messages">
         {messages.map((msg, i) => (
           <div key={i} className={`msg ${msg.role}`}>
