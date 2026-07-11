@@ -1,0 +1,21 @@
+# Secrets
+.env*
+!.env.example
+
+# Article archive stays out of the repo
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Node / Next.js
+node_modules/
+.next/
+.vercel/
+
+# OS
+.DS_Store
