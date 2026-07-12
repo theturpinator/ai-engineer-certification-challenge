@@ -46,6 +46,34 @@ async def test_car_extraction_lands_in_garage():
 
 
 @pytest.mark.asyncio
+async def test_partial_car_mention_lands_same_turn():
+    """The production repro: a partial mention (trim + color, no year) must
+    create a garage car in the SAME turn; the year arriving later updates
+    that same car and derives the generation."""
+    user_id = str(uuid.uuid4())
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            await collect_events(
+                client,
+                "Hey what's good! My name is Brendan and I have a blue mustang GT",
+                user_id,
+            )
+            cars = (await client.get(f"/garage/{user_id}")).json()["profile"].get("cars") or []
+            assert len(cars) == 1, cars
+            car = cars[0]
+            assert "gt" in str(car.get("trim", "")).lower(), car
+            assert "blue" in str(car.get("color", "")).lower(), car
+
+            await collect_events(client, "Oh, it's a 2016 by the way.", user_id)
+            cars2 = (await client.get(f"/garage/{user_id}")).json()["profile"]["cars"]
+            assert len(cars2) == 1, cars2  # same car updated, not a second entry
+            assert cars2[0]["id"] == car["id"], cars2
+            assert int(cars2[0]["year"]) == 2016, cars2
+            assert cars2[0].get("generation") == "S550", cars2  # derived
+
+
+@pytest.mark.asyncio
 async def test_preference_round_trip():
     user_id = str(uuid.uuid4())
     async with app.router.lifespan_context(app):

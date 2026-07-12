@@ -84,7 +84,13 @@ Memory policy:
 - Whenever the user mentions facts about one of their own cars — model year, \
 trim, generation (e.g. S550), color, nickname, installed mods, \
 wishlist/planned mods, or goals (track, show, daily driver) — silently call \
-update_garage with those facts. The garage holds multiple cars: pass the \
+update_garage with those facts. Record the car IMMEDIATELY, on its FIRST \
+mention, with whatever is known so far — partial info is expected: a trim \
+alone, or a color plus model, is enough ("I have a blue Mustang GT" means \
+you call update_garage right away with trim GT and color blue). NEVER wait \
+for complete details like the model year before recording; you may ask a \
+follow-up question, but record first, then update the SAME car as more \
+details arrive in later turns. The garage holds multiple cars: pass the \
 `car` argument with the user's own words for which car they mean (e.g. \
 "my 2016 GT", "the Fox-body"). When the user mentions a car of theirs that \
 is NOT yet in their garage profile, record it as a new garage entry by \
@@ -259,8 +265,8 @@ def _match_car(cars: list[dict], desc: str | None, updates: dict) -> dict | None
             return c
     if len(cars) == 1 and not _conflicts(cars[0], updates):
         return cars[0]
-    if any(updates.get(k) for k in ("year", "trim", "generation")):
-        return None  # identifying info matching no car -> new entry
+    if any(updates.get(k) for k in ("year", "trim", "generation", "color")):
+        return None  # identifying info (trim/color count) matching no car -> new entry
     return cars[0] if cars else None  # ponytail: ambiguous target defaults to first car
 
 
@@ -344,6 +350,35 @@ async def _summarize(user_id: str, session_id: str, user_text: str, parts: list[
 def _car_desc(car: dict) -> str:
     """'2016 S550 GT Premium' — identity fields only, in a natural order."""
     return " ".join(str(car[k]) for k in ("year", "generation", "trim") if car.get(k))
+
+
+GENERATIONS = (
+    (1964, 1973, "First generation"),  # 1964½ cars are first-gen
+    (1974, 1978, "Mustang II"),
+    (1979, 1993, "Fox-body"),
+    (1994, 2004, "SN95"),
+    (2005, 2014, "S197"),
+    (2015, 2023, "S550"),
+    (2024, 9999, "S650"),
+)
+
+
+def _derive_generation(year) -> str | None:
+    """Mustang generation short name for a model year, or None if unmappable."""
+    try:
+        y = int(year)
+    except (TypeError, ValueError):
+        return None
+    return next((g for lo, hi, g in GENERATIONS if lo <= y <= hi), None)
+
+
+def _autofill_generation(car: dict) -> None:
+    """Fill in the generation from the year when missing (all merge paths:
+    chat tool, PATCH, and picker POST route through this)."""
+    if car.get("year") and not car.get("generation"):
+        gen = _derive_generation(car["year"])
+        if gen:
+            car["generation"] = gen
 
 
 # --- Build fingerprints: what makes a portrait or stats block stale ---
@@ -594,15 +629,20 @@ async def update_garage(
     wishlist: list[str] | None = None,
     goals: list[str] | None = None,
 ) -> str:
-    """Record facts the user reveals about their own Mustang(s). The garage
-    holds multiple cars. Pass `car` with the user's own words for which car
-    they mean (e.g. "my 2016 GT", "the Fox-body") whenever they own more than
-    one or mention a car not yet in their garage — an unknown car automatically
-    becomes a new garage entry. Per-car facts: model year, trim (e.g. GT
-    Premium), generation (e.g. S550), color, nickname, installed mods, and
-    wishlist/planned mods. goals (track, show, daily driver) apply to the user
-    as a whole. All arguments optional; new values merge into the existing
-    profile."""
+    """Record facts the user reveals about their own Mustang(s). Call this
+    IMMEDIATELY the FIRST time the user mentions a car of theirs, with
+    whatever facts are known at that moment — partial info is expected and
+    fine: e.g. the user says "I have a blue Mustang GT" → call
+    update_garage(car="blue Mustang GT", trim="GT", color="blue") right away,
+    no year needed. NEVER wait for complete details; update the same car as
+    more arrives in later turns. The garage holds multiple cars. Pass `car`
+    with the user's own words for which car they mean (e.g. "my 2016 GT",
+    "the Fox-body") whenever they own more than one or mention a car not yet
+    in their garage — an unknown car automatically becomes a new garage
+    entry. Per-car facts: model year, trim (e.g. GT Premium), generation
+    (e.g. S550), color, nickname, installed mods, and wishlist/planned mods.
+    goals (track, show, daily driver) apply to the user as a whole. All
+    arguments optional; new values merge into the existing profile."""
     user_id = config["configurable"]["user_id"]
     updates = {
         k: v
@@ -626,6 +666,7 @@ async def update_garage(
                     target[k] = current + [x for x in v if x not in current]
                 else:
                     target[k] = v
+            _autofill_generation(target)
             if target.get("stats") and target["stats"].get("fp") != _stats_fp(target):
                 target["stats"] = None  # identity or mods changed -> recompute
         if goals:
@@ -797,6 +838,43 @@ class CarPatch(BaseModel):
     wishlist: list[Item] | None = Field(None, max_length=50)
 
 
+ReqStr80 = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)
+]
+
+
+class CarCreate(BaseModel):
+    """Standardized picker intake: the three required identity fields."""
+    year: int = Field(ge=1964, le=2027)
+    trim: ReqStr80
+    color: ReqStr80
+    nickname: ReqStr80 | None = None
+
+
+@app.post("/garage/{user_id}/cars", status_code=201)
+async def create_car(user_id: str, body: CarCreate, background_tasks: BackgroundTasks):
+    """Create a car from the picker; generation derives from the year and
+    enrichment (stats + portrait) runs in the background, like PATCH."""
+    car = {"id": uuid.uuid4().hex[:8], **body.model_dump(exclude_none=True)}
+    _autofill_generation(car)
+    async with await _db() as conn:
+        profile = await _load_profile(conn, user_id)
+        cars = profile.setdefault("cars", [])
+        # ponytail: same year+trim = same car -> 409; merging risks clobbering
+        if any(str(c.get("year")) == str(car["year"])
+               and str(c.get("trim", "")).lower() == car["trim"].lower()
+               for c in cars):
+            raise HTTPException(409, "that year and trim is already in the garage")
+        cars.append(car)
+        await conn.execute(
+            "INSERT INTO garage (user_id, profile) VALUES (%s, %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET profile = EXCLUDED.profile",
+            (user_id, Json(profile)),
+        )
+    background_tasks.add_task(_enrich_garage, user_id)
+    return car
+
+
 @app.patch("/garage/{user_id}/cars/{car_id}")
 async def patch_car(user_id: str, car_id: str, patch: CarPatch,
                     background_tasks: BackgroundTasks):
@@ -811,6 +889,7 @@ async def patch_car(user_id: str, car_id: str, patch: CarPatch,
                 target.pop(k, None)
             else:
                 target[k] = v
+        _autofill_generation(target)
         if target.get("stats") and target["stats"].get("fp") != _stats_fp(target):
             target["stats"] = None  # identity or mods changed -> recompute
         await conn.execute(

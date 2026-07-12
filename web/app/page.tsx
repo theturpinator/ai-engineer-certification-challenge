@@ -22,6 +22,146 @@ function ago(iso: string) {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
+// --- Standardized car intake (issue #15) ---
+
+const YEARS = Array.from({ length: 2027 - 1964 + 1 }, (_, i) => String(2027 - i));
+const TRIMS = ["Base", "EcoBoost", "GT", "Mach 1", "Bullitt", "Boss 302", "Boss 429",
+  "LX", "SVO", "Cobra", "GT350", "GT500", "Dark Horse", "Other"];
+const COLORS = ["Black", "White", "Silver", "Gray", "Red", "Race Red", "Blue",
+  "Grabber Blue", "Green", "Yellow", "Orange", "Burgundy", "Brown", "Purple", "Other"];
+
+type NewCar = { year: number; trim: string; color: string; nickname?: string };
+
+function AddCarModal({
+  uid,
+  onClose,
+  onAdded,
+}: {
+  uid: string;
+  onClose: () => void;
+  onAdded: (car: NewCar) => void;
+}) {
+  const [year, setYear] = useState("");
+  const [trim, setTrim] = useState("");
+  const [trimOther, setTrimOther] = useState("");
+  const [color, setColor] = useState("");
+  const [colorOther, setColorOther] = useState("");
+  const [nickname, setNickname] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+
+  const finalTrim = trim === "Other" ? trimOther.trim() : trim;
+  const finalColor = color === "Other" ? colorOther.trim() : color;
+  const ready = year && finalTrim && finalColor;
+
+  async function save() {
+    setSaving(true);
+    setErr("");
+    try {
+      const r = await fetch(`${API_URL}/garage/${uid}/cars`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          year: parseInt(year, 10),
+          trim: finalTrim,
+          color: finalColor,
+          nickname: nickname.trim() || undefined,
+        }),
+      });
+      if (r.status === 409) throw new Error("dup");
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      onAdded(await r.json());
+    } catch (e) {
+      setErr(
+        e instanceof Error && e.message === "dup"
+          ? "That year and trim is already in your garage."
+          : "Couldn’t save — please try again."
+      );
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="modal" onClick={onClose}>
+      <div
+        className="sheet"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-label="Add your car"
+      >
+        <h2>Add your car</h2>
+        <p className="empty">Ford Mustang — pick the year, trim, and color.</p>
+        <div className="editgrid">
+          <label>
+            <span className="fieldlabel">Year *</span>
+            <select value={year} onChange={(e) => setYear(e.target.value)}>
+              <option value="">Select…</option>
+              {YEARS.map((y) => (
+                <option key={y} value={y}>{y}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span className="fieldlabel">Trim *</span>
+            <select value={trim} onChange={(e) => setTrim(e.target.value)}>
+              <option value="">Select…</option>
+              {TRIMS.map((t) => (
+                <option key={t} value={t}>{t}</option>
+              ))}
+            </select>
+          </label>
+          {trim === "Other" && (
+            <label>
+              <span className="fieldlabel">Trim name *</span>
+              <input
+                value={trimOther}
+                onChange={(e) => setTrimOther(e.target.value)}
+                placeholder="e.g. Grande"
+              />
+            </label>
+          )}
+          <label>
+            <span className="fieldlabel">Color *</span>
+            <select value={color} onChange={(e) => setColor(e.target.value)}>
+              <option value="">Select…</option>
+              {COLORS.map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+          </label>
+          {color === "Other" && (
+            <label>
+              <span className="fieldlabel">Color name *</span>
+              <input
+                value={colorOther}
+                onChange={(e) => setColorOther(e.target.value)}
+                placeholder="e.g. Eleanor Gray"
+              />
+            </label>
+          )}
+          <label>
+            <span className="fieldlabel">Nickname</span>
+            <input
+              value={nickname}
+              onChange={(e) => setNickname(e.target.value)}
+              placeholder="Optional"
+            />
+          </label>
+        </div>
+        {err && <p className="formerr">{err}</p>}
+        <div className="editactions">
+          <button type="button" className="secondary" onClick={onClose} disabled={saving}>
+            Cancel
+          </button>
+          <button type="button" onClick={save} disabled={saving || !ready}>
+            {saving ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Chat() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -29,6 +169,8 @@ export default function Chat() {
   const [chats, setChats] = useState<ChatMeta[]>([]);
   const [drawer, setDrawer] = useState(false);
   const [chatId, setChatId] = useState("");
+  const [picker, setPicker] = useState(false);
+  const [carPrompt, setCarPrompt] = useState(false);
   const userId = useRef<string>("");
   const sessionId = useRef<string>("");
   const bottom = useRef<HTMLDivElement>(null);
@@ -49,6 +191,15 @@ export default function Chat() {
     sessionId.current = sid;
     // "default" is the pre-multi-chat thread, so existing history shows up.
     setChatId(localStorage.getItem("md_chat_id") || "default");
+    // Empty garage -> suggest the picker (once; dismissal sticks).
+    if (localStorage.getItem("md_addcar_prompt") !== "dismissed") {
+      fetch(`${API_URL}/garage/${id}`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((g) => {
+          if (g && !g.profile?.cars?.length) setCarPrompt(true);
+        })
+        .catch(() => {});
+    }
   }, []);
 
   // The server transcript is the source of truth when (re)opening a chat.
@@ -85,6 +236,24 @@ export default function Chat() {
 
   function newChat() {
     switchTo(crypto.randomUUID().slice(0, 8));
+  }
+
+  function dismissCarPrompt() {
+    setCarPrompt(false);
+    localStorage.setItem("md_addcar_prompt", "dismissed");
+  }
+
+  function carAdded(car: NewCar) {
+    setPicker(false);
+    setCarPrompt(false);
+    // client-side confirmation only — not an LLM turn, not in the transcript
+    setMessages((m) => [
+      ...m,
+      {
+        role: "assistant",
+        content: `🏁 Added your ${car.year} Mustang ${car.trim} to the garage — check My Garage!`,
+      },
+    ]);
   }
 
   async function send(e: React.FormEvent) {
@@ -149,6 +318,9 @@ export default function Chat() {
 
   return (
     <main>
+      {picker && (
+        <AddCarModal uid={userId.current} onClose={() => setPicker(false)} onAdded={carAdded} />
+      )}
       {drawer && (
         <div className="backdrop" onClick={() => setDrawer(false)}>
           <aside className="drawer" onClick={(e) => e.stopPropagation()} aria-label="Chats">
@@ -183,6 +355,22 @@ export default function Chat() {
         </nav>
       </header>
       <div className="messages">
+        {carPrompt && (
+          <div className="garageprompt">
+            <span>Got a Mustang? Add it to your garage in a few taps.</span>
+            <button type="button" className="addcarchip" onClick={() => setPicker(true)}>
+              + Add your car
+            </button>
+            <button
+              type="button"
+              className="dismiss"
+              aria-label="Dismiss"
+              onClick={dismissCarPrompt}
+            >
+              ×
+            </button>
+          </div>
+        )}
         {messages.map((msg, i) => (
           <div key={i} className={`msg ${msg.role}`}>
             {msg.role === "assistant" ? (
@@ -209,6 +397,11 @@ export default function Chat() {
           </div>
         ))}
         <div ref={bottom} />
+      </div>
+      <div className="chiprow">
+        <button type="button" className="addcarchip" onClick={() => setPicker(true)}>
+          + Add your car
+        </button>
       </div>
       <form onSubmit={send}>
         <input
