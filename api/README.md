@@ -120,7 +120,7 @@ uv run uvicorn app:app --port 8000
 - `GET /garage/{user_id}/cars/{car_id}/image` → the car's portrait (the
   stored content type, `image/png` for generated ones; `Cache-Control:
   public, max-age=86400`); 404 while generation is still pending. Portraits
-  are cartoon illustrations generated in the background by
+  are photorealistic renders generated in the background by
   `openai/gpt-image-1` via the gateway, cached in the `car_images` table.
   Each car's portrait is generated exactly once — at creation — then frozen
   forever; no later edit of any kind triggers another image-model call.

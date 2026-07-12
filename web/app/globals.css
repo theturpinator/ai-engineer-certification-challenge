@@ -656,6 +656,46 @@ button:disabled {
   border-color: #9096a1;
 }
 
+.welcome {
+  margin: auto;
+  text-align: center;
+  color: #9096a1;
+  max-width: 440px;
+}
+
+.welcome .examples {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.welcome .examples button {
+  background: #22252c;
+  border: 1px solid #363b45;
+  color: #e8e6e3;
+  border-radius: 999px;
+  padding: 8px 16px;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.welcome .examples button:hover {
+  border-color: #9096a1;
+}
+
+.memkind {
+  color: #9096a1;
+  font-size: 0.8rem;
+  margin: -4px 0 8px;
+}
+
+.memdate {
+  color: #9096a1;
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
 .garageprompt {
   display: flex;
   align-items: center;

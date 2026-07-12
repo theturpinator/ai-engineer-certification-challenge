@@ -23,7 +23,7 @@ STOCK-baseline stats (Sonnet, critically calibrated, the safety score
 grounded in the car's public NHTSA 5-Star overall rating when one exists —
 carried in stats.nhtsa for the UI to link — validated before caching, and
 cached in the car with an identity fingerprint) and a one-time AI-generated
-cartoon portrait (gpt-image-1 via the gateway, cached in car_images). The
+photorealistic portrait (gpt-image-1 via the gateway, cached in car_images). The
 portrait is seeded exactly once, at car creation, then frozen forever: no
 identity, color, or mod change ever spends another image-model call (issue
 #34). PUT /garage/{user_id}/cars/{car_id}/image (raw image bytes, <=8 MB)
@@ -731,12 +731,11 @@ async def _generate_stats(car: dict) -> dict | None:
 def _image_prompt(car: dict) -> str:
     color = car.get("color") or "a factory paint color appropriate to that generation"
     return (
-        f"Playful cartoon illustration, full side profile, of a {_car_desc(car)} "
-        f"Ford Mustang in {color}. Bold clean linework, flat cel shading, slightly "
-        "exaggerated proportions (big wheels, low stance) — unmistakably a stylized "
-        "cartoon, NOT a photorealistic car. Body style still clearly recognizable "
-        "for that model year and generation. Dark seamless background, simple soft "
-        "floor shadow. No people, no text, no watermarks."
+        f"Photorealistic studio photograph, full side profile, of a {_car_desc(car)} "
+        f"Ford Mustang in {color}. Accurate body style, proportions, and trim "
+        "details for that exact model year and generation. Dark seamless "
+        "background, simple soft floor shadow, even studio lighting. "
+        "No people, no text, no watermarks."
     )
 
 

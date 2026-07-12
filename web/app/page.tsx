@@ -34,6 +34,12 @@ type ChatMeta = { chat_id: string; title: string; updated_at: string };
 const chatKey = (id: string) => id || "default";
 const EMPTY: Message[] = [];
 
+const EXAMPLES = [
+  "What oil does a 2016 GT take?",
+  "Best first mods for the 5.0 Coyote?",
+  "Tell me about the 1969 Mach 1",
+];
+
 const TOOL_STATUS: Record<string, string> = {
   search_archive: "Searching the archive…",
   web_search: "Searching the web…",
@@ -339,6 +345,16 @@ export default function Chat() {
     bottom.current?.scrollIntoView();
   }, [messages]);
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      setDrawer(false);
+      setPicker(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   function openDrawer() {
     setDrawer(true);
     apiFetch(`${API_URL}/chats/${userId.current}`)
@@ -543,6 +559,7 @@ export default function Chat() {
         Ask MustangDriver
         <nav>
           <AuthButton />
+          <Link href="/profile">Profile</Link>
           <Link href="/garage">My Garage</Link>
         </nav>
       </header>
@@ -561,6 +578,22 @@ export default function Chat() {
             >
               ×
             </button>
+          </div>
+        )}
+        {/* only after the transcript fetch lands, so history never flashes it */}
+        {threads[chatKey(chatId)] !== undefined && messages.length === 0 && (
+          <div className="welcome">
+            <p>
+              Your Mustang copilot — maintenance, mods, recalls, history, and
+              what to buy next.
+            </p>
+            <div className="examples">
+              {EXAMPLES.map((q) => (
+                <button key={q} type="button" onClick={() => send(q)}>
+                  {q}
+                </button>
+              ))}
+            </div>
           </div>
         )}
         {messages.map((msg, i) => (

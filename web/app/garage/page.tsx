@@ -647,6 +647,7 @@ export default function GaragePage() {
         My Garage
         <nav>
           <AuthButton />
+          <Link href="/profile">Profile</Link>
           <Link href="/">Chat</Link>
         </nav>
       </header>
