@@ -174,6 +174,17 @@ export default function Chat() {
   const userId = useRef<string>("");
   const sessionId = useRef<string>("");
   const bottom = useRef<HTMLDivElement>(null);
+  const box = useRef<HTMLTextAreaElement>(null);
+
+  // Auto-grow the composer with its content; CSS max-height caps it at ~5
+  // lines, past which it scrolls. (field-sizing: content would be free, but
+  // Safari/Firefox don't support it yet.)
+  useEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight + el.offsetHeight - el.clientHeight}px`;
+  }, [input]);
 
   useEffect(() => {
     let id = localStorage.getItem("md_user_id");
@@ -256,8 +267,7 @@ export default function Chat() {
     ]);
   }
 
-  async function send(e: React.FormEvent) {
-    e.preventDefault();
+  async function send() {
     const text = input.trim();
     if (!text || busy) return;
     setInput("");
@@ -403,10 +413,25 @@ export default function Chat() {
           + Add your car
         </button>
       </div>
-      <form onSubmit={send}>
-        <input
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          send();
+        }}
+      >
+        <textarea
+          ref={box}
+          rows={1}
           value={input}
           onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => {
+            // Desktop: Enter sends, Shift+Enter newline. Touch keyboards
+            // (coarse pointer): return is a newline; the Send button sends.
+            if (e.key !== "Enter" || e.shiftKey || e.nativeEvent.isComposing) return;
+            if (window.matchMedia("(pointer: coarse)").matches) return;
+            e.preventDefault();
+            send();
+          }}
           placeholder="Ask about Mustangs…"
           aria-label="Message"
         />

@@ -130,9 +130,26 @@ header nav a {
 
 form {
   display: flex;
+  align-items: flex-end; /* Send stays bottom-aligned as the composer grows */
   gap: 8px;
   padding: 10px 0 max(10px, env(safe-area-inset-bottom));
   border-top: 1px solid #2b2f38;
+}
+
+textarea {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid #363b45;
+  background: #1d2026;
+  color: inherit;
+  font: inherit;
+  font-size: 16px;
+  line-height: 1.5;
+  resize: none;
+  max-height: 142px; /* ~5 lines + padding; JS grows it, this caps it */
+  overflow-y: auto;
 }
 
 input,
