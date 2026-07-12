@@ -38,8 +38,13 @@ function getAuth(): Auth | null {
 
 /** fetch that attaches the app JWT when signed in. On a 401 the token is
  * dead (expired/revoked): clear it and retry once anonymously, so a stale
- * login never blocks the app. */
+ * login never blocks the app. A 30s default timeout keeps a stalled request
+ * from wedging button state forever (issue #29); callers that pass their own
+ * signal (chat streaming's watchdog, photo uploads) override it. */
 export async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
+  if ("timeout" in AbortSignal) {
+    init = { signal: AbortSignal.timeout(30_000), ...init };
+  }
   const auth = typeof window === "undefined" ? null : getAuth();
   if (!auth) return fetch(input, init);
   const r = await fetch(input, {

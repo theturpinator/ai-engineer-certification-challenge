@@ -19,12 +19,16 @@ sentence summary of the session (keyed by user_id + session_id from the
 client), and recent past-session summaries are injected into the system
 prompt. The garage holds multiple cars (profile.cars, legacy flat profiles
 migrate on read); each car is enriched in the background with arcade-style
-STOCK-baseline stats (Sonnet, cached in the car with an identity
-fingerprint) and an AI-generated portrait (gpt-image-1 via the gateway,
-cached in car_images with identity/build fingerprints). The portrait is
-canonical: identity changes (year/generation/trim) regenerate it; build
-changes (color/mods) EDIT the stored photo via gemini-2.5-flash-image, never
-re-rolling. Bars compose deterministically from the committed catalog:
+STOCK-baseline stats (Sonnet, critically calibrated, the safety score
+grounded in the car's public NHTSA 5-Star overall rating when one exists —
+carried in stats.nhtsa for the UI to link — validated before caching, and
+cached in the car with an identity fingerprint) and an AI-generated cartoon
+portrait (gpt-image-1 via the gateway, cached in car_images with
+identity/build fingerprints). The portrait is canonical: identity changes
+(year/generation/trim) regenerate it; build changes (color/mods) EDIT the
+stored image via gemini-2.5-flash-image, never re-rolling. PUT
+/garage/{user_id}/cars/{car_id}/image (raw image bytes, <=8 MB) replaces the
+portrait with the user's own photo, which enrichment never overwrites. Bars compose deterministically from the committed catalog:
 current = stock + summed deltas of recognized installed mods, dream =
 current + wishlist deltas, both clamped 0-100 and returned by the garage
 read/write endpoints so clients never re-derive them. GET
@@ -63,7 +67,8 @@ import jwt
 import numpy as np
 import psycopg
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
+from fastapi import (BackgroundTasks, Depends, FastAPI, Header, HTTPException,
+                     Request)
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token as google_id_token
 from fastapi.middleware.cors import CORSMiddleware
@@ -309,15 +314,36 @@ def _match_car(cars: list[dict], desc: str | None, updates: dict) -> dict | None
     return cars[0] if cars else None  # ponytail: ambiguous target defaults to first car
 
 
+def _dedupe(items: list) -> list:
+    """Order-preserving, case-insensitive dedupe for mods/wishlist: a retried
+    add or a stale-state PATCH must not store an item twice (issue #29)."""
+    seen: set[str] = set()
+    out = []
+    for x in items:
+        k = str(x).strip().lower()
+        if k and k not in seen:
+            seen.add(k)
+            out.append(x)
+    return out
+
+
 async def _load_profile(conn, user_id: str) -> dict:
     """Garage profile, migrated to the cars[] shape. A legacy flat profile is
-    written back once so the migrated car id is stable across reads."""
+    written back once so the migrated car id is stable across reads; ditto
+    duplicated mods/wishlist entries, so old data self-heals (issue #29)."""
     row = await (
         await conn.execute("SELECT profile FROM garage WHERE user_id = %s", (user_id,))
     ).fetchone()
     raw = row[0] if row else {}
     profile = _migrate(dict(raw))
-    if profile != raw:
+    changed = profile != raw
+    for car in profile.get("cars", []):
+        for k in ("mods", "wishlist"):
+            deduped = _dedupe(car.get(k) or [])
+            if deduped != (car.get(k) or []):
+                car[k] = deduped
+                changed = True
+    if changed:
         await conn.execute(
             "INSERT INTO garage (user_id, profile) VALUES (%s, %s) "
             "ON CONFLICT (user_id) DO UPDATE SET profile = EXCLUDED.profile",
@@ -574,8 +600,10 @@ def _compose_bars(car: dict, catalog: list[dict] | None = None) -> dict | None:
 
 
 def _identity_fp(car: dict) -> str:
-    """Core identity (year/generation/trim). Mismatch => portrait regenerated."""
-    return _car_desc(car)
+    """Core identity (year/generation/trim) plus the portrait style version.
+    Mismatch => portrait regenerated (the style tag bump moved every existing
+    photoreal portrait to the cartoon look, issue #30)."""
+    return "cartoon-v1|" + _car_desc(car)
 
 
 def _build_fp(car: dict) -> str:
@@ -588,8 +616,9 @@ def _stats_fp(car: dict) -> str:
     """Identity only: stats are the STOCK baseline; installed mods compose
     deterministically via the catalog deltas, never via the LLM. The schema
     version regenerates every cached baseline when the stat set changes
-    (v2 = ownership stats, issue #27)."""
-    return json.dumps({"identity": _car_desc(car), "v": 2})
+    (v2 = ownership stats, issue #27; v3 = critical calibration + NHTSA
+    grounding, issue #32 — also flushes cached all-zero baselines, #28)."""
+    return json.dumps({"identity": _car_desc(car), "v": 3})
 
 
 def _portrait_action(stored: tuple[str | None, str | None] | None, car: dict) -> str:
@@ -602,38 +631,102 @@ def _portrait_action(stored: tuple[str | None, str | None] | None, car: dict) ->
     return "skip"
 
 
-STATS_PROMPT = """You are a Ford Mustang encyclopedia. For the {desc} Ford \
-Mustang described below, reply with ONLY this JSON object, no other text:
+STATS_PROMPT = """You are a critical automotive reviewer, not a salesman. For \
+the {desc} Ford Mustang described below, reply with ONLY this JSON object, no \
+other text:
 {{"power": <0-100>, "acceleration": <0-100>, "top_speed": <0-100>, \
 "handling": <0-100>, "braking": <0-100>, "style": <0-100>, \
 "comfort": <0-100>, "safety": <0-100>, "reliability": <0-100>, \
 "hp": <stock horsepower, integer>, \
 "zero_to_sixty": <stock 0-60 mph time in seconds, float>, \
 "top_speed_mph": <stock top speed in mph, integer>}}
-The 0-100 values are arcade-racing-game ratings calibrated across the entire \
-Mustang range, 1964 to today. Performance (power, acceleration, top_speed, \
-handling, braking): a 1974 Mustang II is roughly 15-25 power, a base 1990s \
-V6 around 30-40, a 2015+ GT around 75-85, a 2020 Shelby GT500 is 95-100. \
-Ownership (style, comfort, safety, reliability): rate the stock car across \
-the same 60-year range — a 1965 coupe is low on safety (no airbags or ABS) \
-and comfort but iconic on style; an S650 rates high on safety and comfort; \
-reliability reflects the platform's reputation and age-appropriate \
-robustness when stock.
+The 0-100 values are arcade-racing-game ratings calibrated against ALL cars \
+on the road today, not just Mustangs: 50 is an average modern car, and 90+ is \
+reserved for the absolute best in class of anything on sale. Be critical, not \
+flattering — most Mustangs land mid-pack in most categories.
+Performance (power, acceleration, top_speed, handling, braking): a 1974 \
+Mustang II is roughly 15-25 power, a base 1990s V6 around 30-40, a 2015+ GT \
+around 70-80; a 2020 Shelby GT500 nears 95 on power, but no Mustang \
+out-handles a purpose-built sports car.
+Ownership (style, comfort, safety, reliability): judge the stock car \
+honestly. Safety: {grounding} A two-door sports coupe is never a 90+ safety \
+car — a modern 5-star-rated Mustang belongs around 65-80, a 4-star car \
+50-65, and pre-airbag classics 5-20. Comfort: firm sporty coupes rarely \
+clear 70. Reliability: reflect the platform's real reputation, known \
+problem years, and its age.
 The car is completely stock (factory condition, no modifications); rate it as \
 such. Installed modifications are scored separately and must NOT be reflected \
-here — every figure is the STOCK factory baseline."""
+here — every figure is the STOCK factory baseline. If this exact year/trim \
+combination was never actually produced, rate the closest real Mustang \
+matching the description — never refuse and never return zeros."""
+
+
+async def _nhtsa_rating(year) -> dict | None:
+    """NHTSA 5-Star overall rating for the Mustang model year (public API, no
+    key — same agency as check_recalls). None when unrated (pre-2011 model
+    years) or unreachable: grounding is best-effort by design."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"https://api.nhtsa.gov/SafetyRatings/modelyear/{int(year)}"
+                "/make/FORD/model/MUSTANG")
+            results = r.json().get("Results") or []
+            if not results:
+                return None
+            # prefer the coupe ("2 DR") variant over the convertible ("C")
+            vid = next((v for v in results if "2 DR" in v["VehicleDescription"]),
+                       results[0])["VehicleId"]
+            r = await client.get(
+                f"https://api.nhtsa.gov/SafetyRatings/VehicleId/{vid}")
+            res = (r.json().get("Results") or [{}])[0]
+            return {"stars": int(res["OverallRating"]),  # "Not Rated" -> except
+                    "vehicle": res.get("VehicleDescription", ""),
+                    "url": "https://www.nhtsa.gov/ratings"}
+    except Exception:
+        return None
+
+
+def _valid_stats(stats: dict) -> bool:
+    """A usable stock baseline: all nine ratings present, in range, not all
+    zero, and real hp/0-60/top-speed figures. Anything else is a partial or
+    hallucinated reply and must never be cached (issue #28)."""
+    try:
+        ratings = [float(stats[k]) for k in BAR_STATS]
+        figures = [float(stats[k])
+                   for k in ("hp", "zero_to_sixty", "top_speed_mph")]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (all(0 <= r <= 100 for r in ratings) and any(ratings)
+            and all(f > 0 for f in figures))
 
 
 async def _generate_stats(car: dict) -> dict | None:
-    """The car's STOCK baseline (mods compose on top via catalog deltas)."""
+    """The car's STOCK baseline (mods compose on top via catalog deltas),
+    with the safety score grounded in the car's NHTSA 5-Star rating when one
+    exists. An invalid block is rejected so the next enrichment retries."""
     desc = _car_desc(car)
     if not desc:
         return None
-    resp = await _stats_llm.ainvoke(STATS_PROMPT.format(desc=desc))
+    nhtsa = await _nhtsa_rating(car.get("year"))
+    grounding = (
+        f"NHTSA rates the {nhtsa['vehicle']} {nhtsa['stars']}/5 stars overall "
+        "— anchor the safety score to that."
+        if nhtsa else
+        "this model year has no NHTSA 5-Star rating; score it by its "
+        "era-appropriate safety equipment."
+    )
+    resp = await _stats_llm.ainvoke(
+        STATS_PROMPT.format(desc=desc, grounding=grounding))
     m = re.search(r"\{.*\}", resp.content, re.S)
-    if not m:
+    try:
+        stats = json.loads(m.group()) if m else None
+    except json.JSONDecodeError:
+        stats = None
+    if not stats or not _valid_stats(stats):
+        print(f"stats rejected for {desc}: {resp.content[:200]!r}")
         return None
-    stats = json.loads(m.group())
+    if nhtsa:
+        stats["nhtsa"] = nhtsa  # shown in the UI with a link to nhtsa.gov
     stats["fp"] = _stats_fp(car)  # cache key: recompute only when this drifts
     return stats
 
@@ -641,10 +734,12 @@ async def _generate_stats(car: dict) -> dict | None:
 def _image_prompt(car: dict) -> str:
     color = car.get("color") or "a factory paint color appropriate to that generation"
     return (
-        f"Photorealistic studio photograph, full side profile, of a {_car_desc(car)} "
-        f"Ford Mustang in {color}. Body style exactly accurate for that model year "
-        "and generation. Dark seamless studio background, soft reflective floor, "
-        "dramatic rim lighting. No people, no text, no watermarks."
+        f"Playful cartoon illustration, full side profile, of a {_car_desc(car)} "
+        f"Ford Mustang in {color}. Bold clean linework, flat cel shading, slightly "
+        "exaggerated proportions (big wheels, low stance) — unmistakably a stylized "
+        "cartoon, NOT a photorealistic car. Body style still clearly recognizable "
+        "for that model year and generation. Dark seamless background, simple soft "
+        "floor shadow. No people, no text, no watermarks."
     )
 
 
@@ -694,9 +789,10 @@ def _edit_prompt(old_build_fp: str, car: dict) -> str:
     keep = "angle, lighting, and background" if color_changed else \
         "color, angle, lighting, and background"
     return (
-        "Edit this photo: " + "; ".join(parts) + ". If a modification is not "
-        "externally visible, leave the photo unchanged in that respect. "
-        f"Keep the car, {keep} otherwise identical."
+        "Edit this cartoon illustration: " + "; ".join(parts) + ". If a "
+        "modification is not externally visible, leave the image unchanged in "
+        f"that respect. Keep the cartoon style and the car, {keep} otherwise "
+        "identical."
     )
 
 
@@ -734,16 +830,19 @@ async def _edit_image(user_id: str, car: dict, old_build_fp: str, image: bytes) 
 
 async def _sync_portrait(user_id: str, car: dict) -> None:
     """Bring the stored portrait up to date with the car: generate from scratch
-    when missing or the identity changed, EDIT the stored photo when only the
-    build (color/mods) changed, otherwise leave the bytes untouched."""
+    when missing or the identity changed, EDIT the stored image when only the
+    build (color/mods) changed, otherwise leave the bytes untouched. A photo
+    the user uploaded is canonical and never overwritten (issue #31)."""
     async with await _db() as conn:
         row = await (
             await conn.execute(
-                "SELECT prompt, identity_fp, build_fp, image FROM car_images "
-                "WHERE user_id = %s AND car_id = %s",
+                "SELECT prompt, identity_fp, build_fp, image, user_uploaded "
+                "FROM car_images WHERE user_id = %s AND car_id = %s",
                 (user_id, car["id"]),
             )
         ).fetchone()
+    if row and row[4]:
+        return  # the user's own photo wins over anything we'd generate
     if row and row[1] is None:  # pre-fingerprint row: adopt it, never re-roll
         if row[0] == _image_prompt(car):
             async with await _db() as conn:
@@ -930,6 +1029,8 @@ async def lifespan(app: FastAPI):
                 "user_id TEXT NOT NULL, car_id TEXT NOT NULL, "
                 "image BYTEA NOT NULL, prompt TEXT NOT NULL, "
                 "identity_fp TEXT, build_fp TEXT, "
+                "user_uploaded BOOLEAN NOT NULL DEFAULT FALSE, "
+                "content_type TEXT, "
                 "PRIMARY KEY (user_id, car_id))"
             )
             await conn.execute(  # pre-2.1 installs lack the fingerprint columns
@@ -937,6 +1038,13 @@ async def lifespan(app: FastAPI):
             )
             await conn.execute(
                 "ALTER TABLE car_images ADD COLUMN IF NOT EXISTS build_fp TEXT"
+            )
+            await conn.execute(  # user-photo columns (issue #31)
+                "ALTER TABLE car_images ADD COLUMN IF NOT EXISTS "
+                "user_uploaded BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+            await conn.execute(
+                "ALTER TABLE car_images ADD COLUMN IF NOT EXISTS content_type TEXT"
             )
             await conn.execute(
                 "CREATE TABLE IF NOT EXISTS identities ("
@@ -1133,7 +1241,8 @@ async def car_image(user_id: str, car_id: str, auth_uid: AuthUid = None):
     async with await _db() as conn:
         row = await (
             await conn.execute(
-                "SELECT image FROM car_images WHERE user_id = %s AND car_id = %s",
+                "SELECT image, content_type FROM car_images "
+                "WHERE user_id = %s AND car_id = %s",
                 (user_id, car_id),
             )
         ).fetchone()
@@ -1141,9 +1250,39 @@ async def car_image(user_id: str, car_id: str, auth_uid: AuthUid = None):
         raise HTTPException(404, "portrait not generated yet")
     return Response(
         content=bytes(row[0]),
-        media_type="image/png",
+        media_type=row[1] or "image/png",  # uploads keep their own type (#31)
         headers={"Cache-Control": "public, max-age=86400"},
     )
+
+
+@app.put("/garage/{user_id}/cars/{car_id}/image", status_code=204)
+async def upload_car_image(user_id: str, car_id: str, request: Request,
+                           auth_uid: AuthUid = None):
+    """Replace the portrait with the user's own photo — raw image bytes in the
+    body (no multipart). An uploaded photo is canonical: background enrichment
+    never overwrites it; re-uploading replaces it (issue #31)."""
+    user_id = auth_uid or user_id
+    ctype = (request.headers.get("content-type") or "").split(";")[0].strip()
+    if not ctype.startswith("image/"):
+        raise HTTPException(415, "send an image file")
+    body = await request.body()
+    if not body:
+        raise HTTPException(400, "empty image")
+    if len(body) > 8_000_000:
+        raise HTTPException(413, "image must be under 8 MB")
+    async with await _db() as conn:
+        profile = await _load_profile(conn, user_id)
+        if not any(c["id"] == car_id for c in profile.get("cars", [])):
+            raise HTTPException(404, "car not found")
+        await conn.execute(
+            "INSERT INTO car_images (user_id, car_id, image, prompt, "
+            "content_type, user_uploaded) "
+            "VALUES (%s, %s, %s, 'user upload', %s, TRUE) "
+            "ON CONFLICT (user_id, car_id) DO UPDATE SET "
+            "image = EXCLUDED.image, prompt = EXCLUDED.prompt, "
+            "content_type = EXCLUDED.content_type, user_uploaded = TRUE",
+            (user_id, car_id, body, ctype),
+        )
 
 
 @app.get("/garage/{user_id}/cars/{car_id}/shop")
@@ -1261,6 +1400,8 @@ async def patch_car(user_id: str, car_id: str, patch: CarPatch,
         for k, v in updates.items():
             if v is None:
                 target.pop(k, None)
+            elif isinstance(v, list):
+                target[k] = _dedupe(v)  # retried adds must not double-store (#29)
             else:
                 target[k] = v
         _autofill_generation(target)

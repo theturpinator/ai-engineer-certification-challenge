@@ -168,3 +168,26 @@ def test_apply_updates_scalar_merge_unchanged():
     car = {"trim": "GT"}
     assert _apply_car_updates(car, {"color": "red", "mods": ["intake"]}, {}) == []
     assert car == {"trim": "GT", "color": "red", "mods": ["intake"]}
+
+
+def test_valid_stats_rejects_zero_or_partial_blocks():
+    """Issue #28: a hallucinated all-zero/partial baseline must never cache."""
+    from app import BAR_STATS, _valid_stats
+    good = {**{k: 50 for k in BAR_STATS},
+            "hp": 444, "zero_to_sixty": 4.3, "top_speed_mph": 155}
+    assert _valid_stats(good)
+    assert not _valid_stats({k: 0 for k in good})  # the reported bug block
+    assert not _valid_stats({**good, "hp": 0})
+    assert not _valid_stats({**good, "comfort": 140})
+    assert not _valid_stats({**good, "power": "n/a"})
+    missing = {k: v for k, v in good.items() if k != "safety"}
+    assert not _valid_stats(missing)
+
+
+def test_dedupe_order_preserving_case_insensitive():
+    """Issue #29: a retried wishlist add must not store the item twice."""
+    from app import _dedupe
+    assert _dedupe(["Dashcam", "dashcam ", "Exhaust", "Dashcam"]) == \
+        ["Dashcam", "Exhaust"]
+    assert _dedupe(["", "  ", "Intake"]) == ["Intake"]
+    assert _dedupe([]) == []

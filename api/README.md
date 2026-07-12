@@ -62,7 +62,9 @@ uv run uvicorn app:app --port 8000
       "mods": ["..."], "wishlist": ["..."],
       "stats": {"power": 78, "acceleration": 76, "top_speed": 72,
                 "handling": 70, "braking": 72,
-                "hp": 435, "zero_to_sixty": 4.3, "top_speed_mph": 155},
+                "hp": 435, "zero_to_sixty": 4.3, "top_speed_mph": 155,
+                "nhtsa": {"stars": 5, "vehicle": "2021 Ford Mustang 2 DR RWD",
+                          "url": "https://www.nhtsa.gov/ratings"}},
       "bars": {"current": {"power": 80, "...": 0}, "dream": {"power": 95, "...": 0}}
     }],
     "goals": ["..."]
@@ -72,7 +74,10 @@ uv run uvicorn app:app --port 8000
   All car fields optional; `stats` is `null`/absent until the background
   enrichment fills it (arcade-style 0–100 scores + real figures for that
   year/trim, generated once by Sonnet and cached — always the STOCK
-  baseline). `bars` is composed on read, never stored: `current` = stock
+  baseline, critically calibrated, validated before caching). `stats.nhtsa`
+  carries the car's public NHTSA 5-Star overall rating when one exists
+  (2011+ model years); the safety score is anchored to it and the UI links
+  the source. `bars` is composed on read, never stored: `current` = stock
   stats + the summed per-generation catalog deltas of recognized installed
   mods, `dream` = current + wishlist deltas, both clamped 0–100.
   Mods/wishlist entries resolve to catalog entries by normalized name/alias
@@ -102,19 +107,27 @@ uv run uvicorn app:app --port 8000
   doesn't cover yet. "I have this" / "Add to wishlist" write through the
   normal car PATCH below — this route only reads.
 
-- `GET /garage/{user_id}/cars/{car_id}/image` → the car's AI-generated
-  portrait (`image/png`, `Cache-Control: public, max-age=86400`); 404 while
-  generation is still pending. Portraits are generated in the background by
+- `GET /garage/{user_id}/cars/{car_id}/image` → the car's portrait (the
+  stored content type, `image/png` for generated ones; `Cache-Control:
+  public, max-age=86400`); 404 while generation is still pending. Portraits
+  are cartoon illustrations generated in the background by
   `openai/gpt-image-1` via the gateway, cached in the `car_images` table,
   and regenerated when the car's year/generation/trim/color change.
+
+- `PUT /garage/{user_id}/cars/{car_id}/image` with raw image bytes in the
+  body (`Content-Type: image/*`, ≤8 MB) → 204; replaces the portrait with
+  the user's own photo. An uploaded photo is canonical — background
+  enrichment never overwrites it; re-uploading replaces it. 415 on
+  non-image content, 413 over the size cap.
 
 - `PATCH /garage/{user_id}/cars/{car_id}` with any subset of
   `{year, trim, generation, color, nickname, mods, wishlist}` → the updated
   car (with composed `bars`). UI editing path: scalars overwrite (`null`
-  clears), `mods`/`wishlist` replace wholesale. Validation: year 1964–2027,
-  strings length-capped. Identity changes reset `stats` and queue portrait
-  regeneration; mods changes recompose the bars deterministically (no LLM)
-  and queue a portrait edit.
+  clears), `mods`/`wishlist` replace wholesale (deduped order-preserving,
+  case-insensitive, so a retried add can't double-store). Validation: year
+  1964–2027, strings length-capped. Identity changes reset `stats` and queue
+  portrait regeneration; mods changes recompose the bars deterministically
+  (no LLM) and queue a portrait edit.
 
 - `DELETE /garage/{user_id}/cars/{car_id}` → 204; removes the car and its
   cached portrait.

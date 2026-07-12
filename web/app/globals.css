@@ -337,6 +337,28 @@ button:disabled {
   margin: 8px 0 10px;
 }
 
+.uploadrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: -4px 0 10px;
+}
+
+.uploadbtn {
+  cursor: pointer;
+  background: none;
+  border: 1px solid #363b45;
+  color: #9096a1;
+  border-radius: 8px;
+  padding: 2px 10px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.uploadbtn input {
+  display: none;
+}
+
 .portrait {
   display: block;
   width: 100%;

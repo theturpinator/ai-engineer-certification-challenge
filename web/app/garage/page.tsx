@@ -20,6 +20,7 @@ type Stats = {
   hp?: number;
   zero_to_sixty?: number;
   top_speed_mph?: number;
+  nhtsa?: { stars: number; vehicle?: string; url: string };
 };
 type Bars = { current: Record<string, number>; dream: Record<string, number> };
 type Car = {
@@ -107,7 +108,7 @@ function Portrait({ url }: { url: string }) {
         className="portrait"
         style={state === "ok" ? undefined : { display: "none" }}
         src={`${url}&r=${attempt}`}
-        alt="AI-generated portrait of this car"
+        alt="Portrait of this car"
         // cached images can finish before React attaches onLoad
         ref={(el) => {
           if (el?.complete && el.naturalWidth > 0) setState("ok");
@@ -124,6 +125,53 @@ function Portrait({ url }: { url: string }) {
         }}
       />
     </div>
+  );
+}
+
+function UploadPhoto({
+  uid,
+  carId,
+  onUploaded,
+}: {
+  uid: string;
+  carId: string;
+  onUploaded: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  return (
+    <p className="uploadrow">
+      <label className="uploadbtn">
+        {busy ? "Uploading…" : "Use my own photo"}
+        <input
+          type="file"
+          accept="image/*"
+          disabled={busy}
+          onChange={async (e) => {
+            const file = e.target.files?.[0];
+            e.target.value = "";
+            if (!file) return;
+            setBusy(true);
+            setErr("");
+            try {
+              const r = await apiFetch(`${API_URL}/garage/${uid}/cars/${carId}/image`, {
+                method: "PUT",
+                headers: { "Content-Type": file.type || "image/jpeg" },
+                body: file,
+                signal: AbortSignal.timeout(120_000), // big photos beat the 30s default
+              });
+              if (!r.ok) throw new Error(`HTTP ${r.status}`);
+              onUploaded();
+            } catch {
+              setErr("Upload failed — try a smaller image (under 8 MB).");
+            } finally {
+              setBusy(false);
+            }
+          }}
+        />
+      </label>
+      {err && <span className="formerr">{err}</span>}
+    </p>
   );
 }
 
@@ -172,6 +220,15 @@ function StatBars({ stats, bars }: { stats: Stats; bars?: Bars | null }) {
     <>
       {figures && <p className="figures">Stock: {figures}</p>}
       {groups}
+      {stats.nhtsa && (
+        <p className="empty">
+          Safety grounded in the{" "}
+          <a href={stats.nhtsa.url} target="_blank" rel="noopener noreferrer">
+            NHTSA {stats.nhtsa.stars}-star overall safety rating
+          </a>
+          {stats.nhtsa.vehicle ? ` (${stats.nhtsa.vehicle})` : ""}.
+        </p>
+      )}
       {anyDream && (
         <p className="empty">
           Solid bar: current build · light extension: with your wishlist.
@@ -605,6 +662,11 @@ export default function GaragePage() {
                   )}
                   <Portrait
                     url={`${API_URL}/garage/${uid}/cars/${car.id}/image?v=${imgVer}`}
+                  />
+                  <UploadPhoto
+                    uid={uid}
+                    carId={car.id}
+                    onUploaded={() => setImgVer((v) => v + 1)}
                   />
                   {car.stats ? (
                     <StatBars stats={car.stats} bars={car.bars} />
