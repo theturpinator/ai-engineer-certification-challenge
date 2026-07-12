@@ -25,18 +25,27 @@ uv run uvicorn app:app --port 8000
 - `POST /chat` with JSON `{"message": str, "user_id": str, "session_id": str}`
   (`session_id` optional — one per browser visit; omitted requests share a
   `"default"` session) → SSE stream:
-  1. `data: {"type": "tool", "name": "search_archive" | "web_search" | "check_recalls" | "recommend_products"}` —
-     one event per tool call the agent makes (may be interleaved with tokens; zero or more)
-  2. `data: {"type": "token", "text": "..."}` — one event per token as the model generates
-  3. `data: {"type": "ad", "product": str, "advertiser": str, "description": str, "image": url, "link": url, "sponsored": true, "deltas": {"power": int, ...} | null}` —
+  1. `data: {"type": "tool_start", "name": ...}` — emitted the moment the
+     model decides to call a tool (before it runs), so clients can show
+     status ("Searching the archive…") instead of bare dots
+  2. `data: {"type": "tool", "name": "search_archive" | "web_search" | "check_recalls" | "recommend_products" | "update_garage" | "update_instructions"}` —
+     one event per tool call the agent makes, when its result arrives (may
+     be interleaved with tokens; zero or more)
+  3. `data: {"type": "token", "text": "..."}` — one event per token as the model generates
+  4. `data: {"type": "ad", "product": str, "advertiser": str, "description": str, "image": url, "link": url, "sponsored": true, "deltas": {"power": int, ...} | null}` —
      at most two per turn, only when the agent judged the question product-intent
      and called `recommend_products`; `deltas` carries the five-stat change for
      the user's first garage car's generation (null when no car is known).
      `link` is the advertiser's click-through URL with its existing UTM
      parameters; `image` is the hotlinked creative.
-  4. `data: {"type": "citations", "citations": [{"title": "...", "url": "..."}]}` — the
+  5. `data: {"type": "ping"}` — keepalive whenever ~10s (`CHAT_PING_SECONDS`)
+     pass with nothing else to send; clients treat any event as proof of life
+     and may declare the connection dead after ~30s of total silence
+  6. `data: {"type": "error"}` — the stream failed server-side; the real
+     exception is in the server log only. Always followed by `[DONE]`.
+  7. `data: {"type": "citations", "citations": [{"title": "...", "url": "..."}]}` — the
      articles actually retrieved this turn (empty list if no retrieval)
-  5. `data: [DONE]`
+  8. `data: [DONE]`
 
 - `GET /garage/{user_id}` →
   `{"profile": {...}, "instructions": [...], "summaries": [{"summary": str, "date": "YYYY-MM-DD"}, ...]}` —

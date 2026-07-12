@@ -1,6 +1,8 @@
 """Ask MustangDriver chat API.
 
-FastAPI app: POST /chat streams SSE tokens + tool/citations/ad events from a
+FastAPI app: POST /chat streams SSE tokens + tool_start/tool/citations/ad
+events, ~10s keepalive pings during silence, and a generic error event on
+stream failure (real exception server-log only), from a
 LangGraph ReAct agent with four tools: search_archive (in-memory Qdrant over
 index_artifact/, built at startup), web_search (Tavily, live web),
 check_recalls (NHTSA Recalls API), and recommend_products (intent-gated
@@ -48,6 +50,7 @@ import base64
 import json
 import os
 import re
+import traceback
 import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -1052,6 +1055,30 @@ class ChatRequest(BaseModel):
     chat_id: str = "default"  # the pre-multi-chat thread survives as "default"
 
 
+async def _heartbeat(gen, interval: float | None = None):
+    """Pass gen through, inserting a ping event whenever `interval` seconds
+    pass without an item, so clients can tell a slow tool call from a dead
+    connection (issue #26)."""
+    if interval is None:
+        interval = float(os.environ.get("CHAT_PING_SECONDS", "10"))
+    it = aiter(gen)
+    try:
+        nxt = asyncio.ensure_future(anext(it))
+        while True:
+            done, _ = await asyncio.wait({nxt}, timeout=interval)
+            if not done:
+                yield f"data: {json.dumps({'type': 'ping'})}\n\n"
+                continue
+            try:
+                item = nxt.result()
+            except StopAsyncIteration:
+                return
+            yield item
+            nxt = asyncio.ensure_future(anext(it))
+    finally:
+        nxt.cancel()
+
+
 def _thread_id(user_id: str, chat_id: str) -> str:
     """LangGraph thread per chat; "default" keeps the legacy bare-user_id
     thread so pre-multi-chat history survives."""
@@ -1360,40 +1387,54 @@ async def chat(req: ChatRequest, auth_uid: AuthUid = None):
             }},
             stream_mode="messages",
         )
-        async for msg, _meta in stream:
-            if isinstance(msg, ToolMessage):
-                yield f"data: {json.dumps({'type': 'tool', 'name': msg.name})}\n\n"
-                if msg.name == "search_archive":
-                    for hit in json.loads(msg.content):
-                        if hit["url"] not in seen:
-                            seen.add(hit["url"])
-                            citations.append({"title": hit["title"], "url": hit["url"]})
-                elif msg.name == "recommend_products":
-                    for item in json.loads(msg.content):
-                        entry = _RECO_BY_ID.get(item["id"])
-                        if not entry or ads_sent >= AD_TOP_K:
-                            continue
-                        ads_sent += 1
-                        ad = {
-                            "type": "ad",
-                            "product": entry["name"],
-                            "advertiser": entry["advertiser"],
-                            "description": entry["description"],
-                            "image": entry["image"],
-                            "link": entry["link"],
-                            "sponsored": True,
-                            "deltas": entry["deltas"].get(active_gen)
-                            if active_gen else None,
-                        }
-                        yield f"data: {json.dumps(ad)}\n\n"
-            elif isinstance(msg, AIMessageChunk) and isinstance(msg.content, str) and msg.content:
-                answer_parts.append(msg.content)
-                yield f"data: {json.dumps({'type': 'token', 'text': msg.content})}\n\n"
+        try:
+            async for msg, _meta in stream:
+                if isinstance(msg, ToolMessage):
+                    yield f"data: {json.dumps({'type': 'tool', 'name': msg.name})}\n\n"
+                    if msg.name == "search_archive":
+                        for hit in json.loads(msg.content):
+                            if hit["url"] not in seen:
+                                seen.add(hit["url"])
+                                citations.append({"title": hit["title"], "url": hit["url"]})
+                    elif msg.name == "recommend_products":
+                        for item in json.loads(msg.content):
+                            entry = _RECO_BY_ID.get(item["id"])
+                            if not entry or ads_sent >= AD_TOP_K:
+                                continue
+                            ads_sent += 1
+                            ad = {
+                                "type": "ad",
+                                "product": entry["name"],
+                                "advertiser": entry["advertiser"],
+                                "description": entry["description"],
+                                "image": entry["image"],
+                                "link": entry["link"],
+                                "sponsored": True,
+                                "deltas": entry["deltas"].get(active_gen)
+                                if active_gen else None,
+                            }
+                            yield f"data: {json.dumps(ad)}\n\n"
+                elif isinstance(msg, AIMessageChunk):
+                    # The model has decided to call a tool: tell the client
+                    # which one, so it can show status instead of bare dots.
+                    for tc in (msg.tool_call_chunks or []):
+                        if tc.get("name"):
+                            yield f"data: {json.dumps({'type': 'tool_start', 'name': tc['name']})}\n\n"
+                    if isinstance(msg.content, str) and msg.content:
+                        answer_parts.append(msg.content)
+                        yield f"data: {json.dumps({'type': 'token', 'text': msg.content})}\n\n"
+        except Exception:
+            # Real error goes to the server log only; the client gets a
+            # generic event it can render as a friendly message (issue #26).
+            traceback.print_exc()
+            yield f"data: {json.dumps({'type': 'error'})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         yield f"data: {json.dumps({'type': 'citations', 'citations': citations})}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
-        sse(),
+        _heartbeat(sse()),
         media_type="text/event-stream",
         background=BackgroundTask(
             _post_turn, user_id, req.session_id, req.message, answer_parts

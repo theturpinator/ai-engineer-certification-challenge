@@ -108,6 +108,29 @@ header nav a {
   background: #22252c;
 }
 
+.pending {
+  color: #9096a1;
+  font-style: italic;
+}
+
+.stallnote {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #ff7a66;
+  font-size: 0.9em;
+  margin-top: 4px;
+}
+
+.stallnote button {
+  padding: 4px 12px;
+  border: 1px solid #363b45;
+  border-radius: 8px;
+  background: #22252c;
+  color: #e8e6e3;
+  cursor: pointer;
+}
+
 .msg p:first-child {
   margin-top: 4px;
 }

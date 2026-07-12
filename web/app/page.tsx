@@ -23,8 +23,49 @@ type Message = {
   content: string;
   citations?: Citation[];
   ads?: Ad[];
+  status?: string; // transient "Searching the archive…" while a tool runs
+  error?: boolean; // stream died; show the retry affordance
+  retryText?: string;
 };
 type ChatMeta = { chat_id: string; title: string; updated_at: string };
+
+// The pre-multi-chat thread is "default" server-side; normalize the client's
+// transient "" so per-chat buffers and the request body always agree.
+const chatKey = (id: string) => id || "default";
+const EMPTY: Message[] = [];
+
+const TOOL_STATUS: Record<string, string> = {
+  search_archive: "Searching the archive…",
+  web_search: "Searching the web…",
+  check_recalls: "Checking recalls…",
+  recommend_products: "Finding products…",
+  update_garage: "Updating your garage…",
+  update_instructions: "Noting your preference…",
+};
+
+// The server pings every ~10s whenever nothing else is streaming, so this
+// long a silence can only mean a dead connection — not a slow tool call.
+const WATCHDOG_MS = 30_000;
+
+async function readWithTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  ms: number
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reader.cancel().catch(() => {});
+          reject(new Error(`stream stalled: no data for ${ms / 1000}s`));
+        }, ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function AdCard({ ad }: { ad: Ad }) {
   return (
@@ -199,9 +240,11 @@ function AddCarModal({
 }
 
 export default function Chat() {
-  const [messages, setMessages] = useState<Message[]>([]);
+  // Per-chat buffers: an in-flight stream keeps writing into its own chat's
+  // thread, so switching away and back never corrupts what's on screen.
+  const [threads, setThreads] = useState<Record<string, Message[]>>({});
+  const [streaming, setStreaming] = useState<Record<string, boolean>>({});
   const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
   const [chats, setChats] = useState<ChatMeta[]>([]);
   const [drawer, setDrawer] = useState(false);
   const [chatId, setChatId] = useState("");
@@ -209,8 +252,25 @@ export default function Chat() {
   const [carPrompt, setCarPrompt] = useState(false);
   const userId = useRef<string>("");
   const sessionId = useRef<string>("");
+  const streamingRef = useRef<Record<string, boolean>>({});
   const bottom = useRef<HTMLDivElement>(null);
   const box = useRef<HTMLTextAreaElement>(null);
+
+  const messages = threads[chatKey(chatId)] ?? EMPTY;
+  const busy = !!streaming[chatKey(chatId)];
+
+  function updateThread(k: string, fn: (msgs: Message[]) => Message[]) {
+    setThreads((t) => ({ ...t, [k]: fn(t[k] ?? []) }));
+  }
+  function patchLast(k: string, fn: (last: Message) => Message) {
+    updateThread(k, (msgs) =>
+      msgs.length ? [...msgs.slice(0, -1), fn(msgs[msgs.length - 1])] : msgs
+    );
+  }
+  function setStreamFlag(k: string, v: boolean) {
+    streamingRef.current[k] = v;
+    setStreaming((s) => ({ ...s, [k]: v }));
+  }
 
   // Auto-grow the composer with its content; CSS max-height caps it at ~5
   // lines, past which it scrolls. (field-sizing: content would be free, but
@@ -249,12 +309,15 @@ export default function Chat() {
     }
   }, []);
 
-  // The server transcript is the source of truth when (re)opening a chat.
+  // The server transcript is the source of truth when (re)opening a chat —
+  // unless a stream is live for it, in which case the buffer is fresher.
   useEffect(() => {
     if (!chatId || !userId.current) return;
+    const k = chatKey(chatId);
+    if (streamingRef.current[k]) return;
     apiFetch(`${API_URL}/chats/${userId.current}/${chatId}/messages`)
       .then((r) => (r.ok ? r.json() : []))
-      .then(setMessages)
+      .then((msgs) => setThreads((t) => ({ ...t, [k]: msgs })))
       .catch(() => {});
   }, [chatId]);
 
@@ -277,7 +340,8 @@ export default function Chat() {
     // A resumed or new chat is a fresh session for episodic memory.
     sessionId.current = crypto.randomUUID();
     sessionStorage.setItem("md_session_id", sessionId.current);
-    setMessages([]);
+    // No buffer reset: an in-flight stream for the old chat keeps draining
+    // into its own thread and is still there when the user switches back.
     setChatId(id);
   }
 
@@ -294,7 +358,7 @@ export default function Chat() {
     setPicker(false);
     setCarPrompt(false);
     // client-side confirmation only — not an LLM turn, not in the transcript
-    setMessages((m) => [
+    updateThread(chatKey(chatId), (m) => [
       ...m,
       {
         role: "assistant",
@@ -303,31 +367,47 @@ export default function Chat() {
     ]);
   }
 
-  async function send() {
-    const text = input.trim();
-    if (!text || busy) return;
-    setInput("");
-    setBusy(true);
-    setMessages((m) => [...m, { role: "user", content: text }, { role: "assistant", content: "" }]);
+  async function send(textArg?: string) {
+    const text = (textArg ?? input).trim();
+    const k = chatKey(chatId); // captured: every write below targets THIS chat
+    if (!text || streaming[k]) return;
+    if (textArg === undefined) setInput("");
+    setStreamFlag(k, true);
+    updateThread(k, (m) => [
+      ...m,
+      { role: "user", content: text },
+      { role: "assistant", content: "" },
+    ]);
 
     try {
-      const res = await apiFetch(`${API_URL}/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: text,
-          user_id: userId.current,
-          session_id: sessionId.current,
-          chat_id: chatId || "default",
-        }),
-      });
+      // Never abort after headers arrive: tearing the socket would cancel
+      // generation server-side. The watchdog only fires on true silence,
+      // which the server's ~10s pings rule out on a live connection.
+      const ctrl = new AbortController();
+      const headerTimer = setTimeout(() => ctrl.abort(), WATCHDOG_MS);
+      let res: Response;
+      try {
+        res = await apiFetch(`${API_URL}/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: text,
+            user_id: userId.current,
+            session_id: sessionId.current,
+            chat_id: k,
+          }),
+          signal: ctrl.signal,
+        });
+      } finally {
+        clearTimeout(headerTimer);
+      }
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
       for (;;) {
-        const { done, value } = await reader.read();
+        const { done, value } = await readWithTimeout(reader, WATCHDOG_MS);
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         const events = buffer.split("\n\n");
@@ -337,37 +417,49 @@ export default function Chat() {
           if (data === "[DONE]") continue;
           const parsed = JSON.parse(data);
           if (parsed.type === "token") {
-            setMessages((m) => {
-              const last = m[m.length - 1];
-              return [...m.slice(0, -1), { ...last, content: last.content + parsed.text }];
-            });
+            patchLast(k, (last) => ({
+              ...last,
+              status: undefined,
+              content: last.content + parsed.text,
+            }));
+          } else if (parsed.type === "tool_start") {
+            patchLast(k, (last) => ({
+              ...last,
+              status: TOOL_STATUS[parsed.name as string] ?? "Working…",
+            }));
           } else if (parsed.type === "citations" && parsed.citations.length > 0) {
-            setMessages((m) => {
-              const last = m[m.length - 1];
-              return [...m.slice(0, -1), { ...last, citations: parsed.citations }];
-            });
+            patchLast(k, (last) => ({ ...last, citations: parsed.citations }));
           } else if (parsed.type === "ad") {
-            setMessages((m) => {
-              const last = m[m.length - 1];
-              return [
-                ...m.slice(0, -1),
-                { ...last, ads: [...(last.ads ?? []), parsed as Ad] },
-              ];
-            });
+            patchLast(k, (last) => ({
+              ...last,
+              ads: [...(last.ads ?? []), parsed as Ad],
+            }));
+          } else if (parsed.type === "error") {
+            throw new Error("server reported a stream error");
           }
+          // "tool" and "ping" events just feed the watchdog
         }
       }
     } catch (err) {
-      setMessages((m) => {
-        const last = m[m.length - 1];
-        return [
-          ...m.slice(0, -1),
-          { ...last, content: last.content || `Something went wrong (${err}). Please try again.` },
-        ];
-      });
+      console.error("chat stream failed:", err); // details for debugging only
+      patchLast(k, (last) => ({
+        ...last,
+        status: undefined,
+        error: true,
+        retryText: text,
+      }));
     } finally {
-      setBusy(false);
+      setStreamFlag(k, false);
     }
+  }
+
+  function retry(text: string) {
+    const k = chatKey(chatId);
+    // Drop the failed user+assistant pair, then resend the same message.
+    updateThread(k, (msgs) =>
+      msgs.length && msgs[msgs.length - 1].error ? msgs.slice(0, -2) : msgs
+    );
+    send(text);
   }
 
   return (
@@ -429,11 +521,25 @@ export default function Chat() {
         {messages.map((msg, i) => (
           <div key={i} className={`msg ${msg.role}`}>
             {msg.role === "assistant" ? (
-              <ReactMarkdown components={{ a: NewTabLink }}>
-                {msg.content || "…"}
-              </ReactMarkdown>
+              msg.content ? (
+                <ReactMarkdown components={{ a: NewTabLink }}>
+                  {msg.content}
+                </ReactMarkdown>
+              ) : msg.error ? null : (
+                <p className="pending">{msg.status ?? "…"}</p>
+              )
             ) : (
               msg.content
+            )}
+            {msg.error && (
+              <div className="stallnote">
+                <span>Connection lost — the reply may be incomplete.</span>
+                {msg.retryText && (
+                  <button type="button" onClick={() => retry(msg.retryText!)}>
+                    Retry
+                  </button>
+                )}
+              </div>
             )}
             {msg.ads?.map((ad, j) => (
               <AdCard key={j} ad={ad} />
