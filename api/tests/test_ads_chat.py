@@ -82,7 +82,8 @@ async def test_archive_question_streams_zero_ads():
 
 
 STOCK = {"power": 50, "acceleration": 50, "top_speed": 50,
-         "handling": 50, "braking": 50, "hp": 225, "zero_to_sixty": 6.2,
+         "handling": 50, "braking": 50, "style": 50, "comfort": 50,
+         "safety": 50, "reliability": 50, "hp": 225, "zero_to_sixty": 6.2,
          "top_speed_mph": 140}
 
 

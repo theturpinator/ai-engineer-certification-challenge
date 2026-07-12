@@ -134,3 +134,36 @@ def test_embed_text_carries_searchable_fields():
     text = embed_text(entry)
     for needle in ("TKX", "Vendor Co", "gearbox", "transmission", "manual swap"):
         assert needle in text
+
+
+def test_specific_flag_gates_shop_eligibility():
+    """Issue #27: only concrete installable products from product vendors are
+    specific (Upgrade Shop-eligible); services and broad product lines stay
+    chat-recommendable only."""
+    rec = advertiser_record(make_row())
+    products = [
+        {"name": "S1 4K Dash Cam", "specific": True, "description": "x",
+         "categories": ["electronics"], "keywords": [], "aliases": []},
+        {"name": "Restoration Parts Catalog", "specific": False, "description": "x",
+         "categories": ["restoration parts"], "keywords": [], "aliases": []},
+    ]
+    cam, line = catalog_entries(rec, {"classification": "product vendor",
+                                      "description": "d", "products": products})
+    assert cam["specific"] is True and cam["recommendable"] is True
+    assert line["specific"] is False and line["recommendable"] is True
+    # service products are never shop-eligible, even if flagged specific
+    (tour,) = catalog_entries(rec, {"classification": "service", "description": "d",
+                                    "products": [dict(products[0], name="Route 66 Tour")]})
+    assert tour["recommendable"] is True and tour["specific"] is False
+    # non-vendor campaigns aren't specific; generics always are
+    (camp,) = catalog_entries(rec, {"classification": "giveaway",
+                                    "description": "x", "products": []})
+    assert camp["specific"] is False
+    assert all(g["specific"] for g in generic_entries())
+
+
+def test_stat_set_is_nine_grouped():
+    from ingest_ads import OWNERSHIP_STATS, PERFORMANCE_STATS
+    assert STATS == PERFORMANCE_STATS + OWNERSHIP_STATS
+    assert OWNERSHIP_STATS == ("style", "comfort", "safety", "reliability")
+    assert zero_deltas()["S550"] == {s: 0 for s in STATS}

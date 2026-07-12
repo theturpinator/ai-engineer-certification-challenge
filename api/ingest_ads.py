@@ -11,10 +11,15 @@ classify the advertiser (product vendor / service / event / charity /
 giveaway / placeholder) and extract concrete products with categories,
 keywords, and aliases. Recommendation eligibility = active AND product-or-
 service vendor; the AdSense placeholder, charities, and giveaways are
-ingested but never recommendable. Generic mod categories (supercharger,
+ingested but never recommendable. Products additionally carry a `specific`
+flag (a concrete installable product vs a broad product line or service):
+only specific products appear in the garage Upgrade Shop; broad lines and
+services stay chat-recommendable only. Generic mod categories (supercharger,
 exhaust, ...) join the catalog unbranded. Every entry carries per-generation
-deltas for the five garage stats, generated once here with conservative
-calibration (non-performance products get all zeros), and every entry is
+deltas for the nine garage stats — five performance plus four ownership
+(style, comfort, safety, reliability) — generated once here with
+conservative calibration (performance deltas never invented for
+non-performance goods, which earn ownership deltas instead), and every entry is
 embedded, so the runtime index needs no network at startup. Creative images
 stay hotlinked CDN URLs; click-through links keep their existing UTM
 parameters. Writes:
@@ -38,7 +43,12 @@ ARTIFACT_DIR = API_DIR / "ads_artifact"
 
 MODEL = "anthropic/claude-sonnet-4.5"  # the agent model
 
-STATS = ("power", "acceleration", "top_speed", "handling", "braking")
+PERFORMANCE_STATS = ("power", "acceleration", "top_speed", "handling", "braking")
+# Ownership stats (issue #27): what non-performance products honestly move —
+# dash cam -> safety, seat covers -> comfort, cooling/resto -> reliability,
+# paint/coatings/wheels/exhaust-sound -> style.
+OWNERSHIP_STATS = ("style", "comfort", "safety", "reliability")
+STATS = PERFORMANCE_STATS + OWNERSHIP_STATS
 # Must match app._derive_generation's names — deltas are keyed by these.
 GENERATION_NAMES = ("First generation", "Mustang II", "Fox-body", "SN95",
                     "S197", "S550", "S650")
@@ -137,6 +147,7 @@ def catalog_entries(record: dict, analysis: dict) -> list[dict]:
             "id": record["slug"],
             "name": record["name"],
             "recommendable": False,
+            "specific": False,
             "description": analysis.get("description", ""),
             "categories": [],
             "keywords": [],
@@ -148,6 +159,9 @@ def catalog_entries(record: dict, analysis: dict) -> list[dict]:
         "id": f"{record['slug']}-{slugify(p['name'])}",
         "name": p["name"],
         "recommendable": True,
+        # Upgrade Shop-eligible only if it's a concrete installable product;
+        # services and broad product lines stay chat-recommendable only.
+        "specific": bool(p.get("specific")) and cls == "product vendor",
         "description": p.get("description", ""),
         "categories": p.get("categories", []),
         "keywords": p.get("keywords", []),
@@ -166,6 +180,7 @@ def generic_entries() -> list[dict]:
         "sponsored": False,
         "classification": "generic",
         "recommendable": False,
+        "specific": True,
         "description": f"Generic {name.lower()} upgrade for any Mustang.",
         "categories": categories,
         "keywords": aliases,
@@ -218,6 +233,9 @@ Classify the advertiser and extract what they sell. Reply with ONLY this JSON:
 "giveaway" | "placeholder",
  "description": "<one line: who this advertiser is>",
  "products": [{{"name": "<specific product or product line, not just the brand>",
+   "specific": <true only for a concrete installable product an owner could \
+point to on or in the car (a named part, kit, or device); false for broad \
+product lines, whole catalogs, and services>,
    "description": "<one line: what it is and why a Mustang owner would want it>",
    "categories": ["<one or two of: transmission, drivetrain, engine, \
 forced induction, intake, exhaust, suspension, brakes, wheels, tires, \
@@ -236,9 +254,11 @@ creatives or clearly sold by this advertiser.
 "products" must be []."""
 
 DELTAS_PROMPT = """You are calibrating an arcade-style Mustang build game. \
-The five ratings (power, acceleration, top_speed, handling, braking) are \
-0-100 scores calibrated across the whole Mustang range: a stock 2015+ GT is \
-roughly 75-85 power, a 2020 Shelby GT500 is 95-100.
+Nine ratings, each a 0-100 score calibrated across the whole Mustang range:
+- Performance: power, acceleration, top_speed, handling, braking (a stock \
+2015+ GT is roughly 75-85 power, a 2020 Shelby GT500 is 95-100).
+- Ownership: style, comfort, safety, reliability (a 1965 coupe rates low on \
+safety and comfort, an S650 high).
 
 For the upgrade below, give the rating DELTA (integer change) it makes to a \
 Ford Mustang of each generation. Be conservative and realistic.
@@ -248,17 +268,25 @@ Description: {description}
 Categories: {categories}
 
 Rules:
-- A typical bolt-on adds +1 to +5 on the stats it affects; forced induction \
-adds +10 to +20 power.
-- A product that does not change how the car performs (cosmetics, \
-electronics, apparel, services, travel, restoration/replacement parts) gets \
-ALL ZEROS — never invent performance value.
+- A typical bolt-on adds +1 to +5 on the performance stats it affects; \
+forced induction adds +10 to +20 power.
+- NEVER invent performance value: a product that does not change how the \
+car drives (cosmetics, electronics, apparel, services, travel, restoration/\
+replacement parts) gets zero on all five performance stats.
+- Ownership deltas are where such products earn their keep, when genuine: \
+paint, coatings, lighting, wheels, and exhaust sound/character move style; \
+seats and interior move comfort; cameras, brakes, tires, and lighting move \
+safety; cooling, restoration/replacement parts, and drivetrain refreshes \
+move reliability. Typical honest ownership delta: +2 to +8.
 - 0 for any stat the upgrade doesn't clearly affect; negative only when it \
-genuinely hurts a stat.
+genuinely hurts a stat. Pure apparel/travel/event items get all zeros \
+everywhere.
 
-Reply with ONLY this JSON (integer values, all seven generations):
+Reply with ONLY this JSON (integer values, all seven generations, all nine \
+stats per generation):
 {{"First generation": {{"power": 0, "acceleration": 0, "top_speed": 0, \
-"handling": 0, "braking": 0}}, "Mustang II": {{...}}, "Fox-body": {{...}}, \
+"handling": 0, "braking": 0, "style": 0, "comfort": 0, "safety": 0, \
+"reliability": 0}}, "Mustang II": {{...}}, "Fox-body": {{...}}, \
 "SN95": {{...}}, "S197": {{...}}, "S550": {{...}}, "S650": {{...}}}}"""
 
 

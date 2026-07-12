@@ -361,6 +361,15 @@ button:disabled {
   }
 }
 
+.statshead {
+  color: #9096a1;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin: 10px 0 4px;
+}
+
 .figures {
   color: #ffa04d;
   font-size: 0.85rem;

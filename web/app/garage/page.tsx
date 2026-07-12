@@ -13,6 +13,10 @@ type Stats = {
   top_speed?: number;
   handling?: number;
   braking?: number;
+  style?: number;
+  comfort?: number;
+  safety?: number;
+  reliability?: number;
   hp?: number;
   zero_to_sixty?: number;
   top_speed_mph?: number;
@@ -38,12 +42,20 @@ type Garage = {
 };
 
 const EMPTY = "Nothing here yet — just mention it in chat.";
-const BARS: [keyof Stats, string][] = [
-  ["power", "Power"],
-  ["acceleration", "Accel"],
-  ["top_speed", "Top Speed"],
-  ["handling", "Handling"],
-  ["braking", "Braking"],
+const BAR_GROUPS: [string, [keyof Stats, string][]][] = [
+  ["Performance", [
+    ["power", "Power"],
+    ["acceleration", "Accel"],
+    ["top_speed", "Top Speed"],
+    ["handling", "Handling"],
+    ["braking", "Braking"],
+  ]],
+  ["Ownership", [
+    ["style", "Style"],
+    ["comfort", "Comfort"],
+    ["safety", "Safety"],
+    ["reliability", "Reliability"],
+  ]],
 ];
 
 function carLabel(c: Car) {
@@ -124,31 +136,42 @@ function StatBars({ stats, bars }: { stats: Stats; bars?: Bars | null }) {
     .filter(Boolean)
     .join(" · ");
   let anyDream = false;
-  const rows = BARS.map(([key, label]) => {
-    const stock = Math.max(0, Math.min(100, Number(stats[key]) || 0));
-    const current = bars?.current?.[key] ?? stock;
-    const dream = Math.max(bars?.dream?.[key] ?? current, current);
-    if (dream > current) anyDream = true;
-    return (
-      <div className="stat" key={key}>
-        <span className="label">{label}</span>
-        <div className="bar">
-          {dream > current && (
-            <div className="dreamfill" style={{ width: `${dream}%` }} />
-          )}
-          <div className="fill" style={{ width: `${current}%` }} />
+  const groups = BAR_GROUPS.map(([title, group]) => {
+    // Old cached baselines lack the ownership stats until the background
+    // enrichment regenerates them; hide the group rather than show zeros.
+    if (group.every(([key]) => stats[key] == null)) return null;
+    const rows = group.map(([key, label]) => {
+      const stock = Math.max(0, Math.min(100, Number(stats[key]) || 0));
+      const current = bars?.current?.[key] ?? stock;
+      const dream = Math.max(bars?.dream?.[key] ?? current, current);
+      if (dream > current) anyDream = true;
+      return (
+        <div className="stat" key={key}>
+          <span className="label">{label}</span>
+          <div className="bar">
+            {dream > current && (
+              <div className="dreamfill" style={{ width: `${dream}%` }} />
+            )}
+            <div className="fill" style={{ width: `${current}%` }} />
+          </div>
+          <span className="num">
+            {current}
+            {dream > current && <span className="dreamnum"> →{dream}</span>}
+          </span>
         </div>
-        <span className="num">
-          {current}
-          {dream > current && <span className="dreamnum"> →{dream}</span>}
-        </span>
+      );
+    });
+    return (
+      <div key={title}>
+        <p className="statshead">{title}</p>
+        <div className="stats">{rows}</div>
       </div>
     );
   });
   return (
     <>
       {figures && <p className="figures">Stock: {figures}</p>}
-      <div className="stats">{rows}</div>
+      {groups}
       {anyDream && (
         <p className="empty">
           Solid bar: current build · light extension: with your wishlist.

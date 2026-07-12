@@ -1,4 +1,4 @@
-// Five-stat delta chips ("PWR +15") shared by the chat sponsored cards and
+// Stat delta chips ("PWR +15") shared by the chat sponsored cards and
 // the garage Upgrade Shop. Zero deltas render nothing.
 
 export type Deltas = Partial<Record<string, number>>;
@@ -9,6 +9,10 @@ const STAT_LABELS: [string, string][] = [
   ["top_speed", "SPD"],
   ["handling", "HDL"],
   ["braking", "BRK"],
+  ["style", "STY"],
+  ["comfort", "CMF"],
+  ["safety", "SAF"],
+  ["reliability", "REL"],
 ];
 
 export function DeltaChips({ deltas }: { deltas?: Deltas | null }) {

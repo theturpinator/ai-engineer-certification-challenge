@@ -2,7 +2,7 @@
 matching, generation resolution, and stock + installed = current,
 current + wishlist = dream composition with clamping. No network, no DB."""
 
-from app import _compose_bars, _gen_key, _match_entry, _sum_deltas
+from app import BAR_STATS, _compose_bars, _gen_key, _match_entry, _sum_deltas
 
 SC = {  # generic supercharger
     "id": "generic-supercharger", "name": "Supercharger",
@@ -60,9 +60,7 @@ def test_sum_deltas_per_generation_and_unmatched_zero():
     assert total["power"] == 15 and total["acceleration"] == 12
     fox = _sum_deltas(["whipple", "tkx"], "Fox-body", CATALOG)
     assert fox["power"] == 20 and fox["acceleration"] == 17
-    assert _sum_deltas(["whipple"], None, CATALOG) == {
-        s: 0 for s in ("power", "acceleration", "top_speed", "handling", "braking")
-    }
+    assert _sum_deltas(["whipple"], None, CATALOG) == {s: 0 for s in BAR_STATS}
 
 
 CAR = {"id": "a", "generation": "S550", "mods": [], "wishlist": [],

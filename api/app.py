@@ -586,8 +586,10 @@ def _build_fp(car: dict) -> str:
 
 def _stats_fp(car: dict) -> str:
     """Identity only: stats are the STOCK baseline; installed mods compose
-    deterministically via the catalog deltas, never via the LLM."""
-    return json.dumps({"identity": _car_desc(car)})
+    deterministically via the catalog deltas, never via the LLM. The schema
+    version regenerates every cached baseline when the stat set changes
+    (v2 = ownership stats, issue #27)."""
+    return json.dumps({"identity": _car_desc(car), "v": 2})
 
 
 def _portrait_action(stored: tuple[str | None, str | None] | None, car: dict) -> str:
@@ -603,12 +605,20 @@ def _portrait_action(stored: tuple[str | None, str | None] | None, car: dict) ->
 STATS_PROMPT = """You are a Ford Mustang encyclopedia. For the {desc} Ford \
 Mustang described below, reply with ONLY this JSON object, no other text:
 {{"power": <0-100>, "acceleration": <0-100>, "top_speed": <0-100>, \
-"handling": <0-100>, "braking": <0-100>, "hp": <stock horsepower, integer>, \
+"handling": <0-100>, "braking": <0-100>, "style": <0-100>, \
+"comfort": <0-100>, "safety": <0-100>, "reliability": <0-100>, \
+"hp": <stock horsepower, integer>, \
 "zero_to_sixty": <stock 0-60 mph time in seconds, float>, \
 "top_speed_mph": <stock top speed in mph, integer>}}
 The 0-100 values are arcade-racing-game ratings calibrated across the entire \
-Mustang range, 1964 to today: a 1974 Mustang II is roughly 15-25 power, a base \
-1990s V6 around 30-40, a 2015+ GT around 75-85, a 2020 Shelby GT500 is 95-100.
+Mustang range, 1964 to today. Performance (power, acceleration, top_speed, \
+handling, braking): a 1974 Mustang II is roughly 15-25 power, a base 1990s \
+V6 around 30-40, a 2015+ GT around 75-85, a 2020 Shelby GT500 is 95-100. \
+Ownership (style, comfort, safety, reliability): rate the stock car across \
+the same 60-year range — a 1965 coupe is low on safety (no airbags or ABS) \
+and comfort but iconic on style; an S650 rates high on safety and comfort; \
+reliability reflects the platform's reputation and age-appropriate \
+robustness when stock.
 The car is completely stock (factory condition, no modifications); rate it as \
 such. Installed modifications are scored separately and must NOT be reflected \
 here — every figure is the STOCK factory baseline."""
@@ -1141,7 +1151,7 @@ async def upgrade_shop(user_id: str, car_id: str, auth_uid: AuthUid = None):
     """The car's Upgrade Shop: a recommended strip of 2-3 eligible sponsor
     products (category fit against this car's generation, current mods, and
     wishlist gaps) plus the full catalog — sponsor products and generic mod
-    categories — each row carrying the five delta chips for this car's
+    categories — each row carrying the nine-stat delta chips for this car's
     generation. The have-it/want-it actions write through the existing
     car PATCH endpoint; this route only reads."""
     user_id = auth_uid or user_id
@@ -1167,9 +1177,11 @@ async def upgrade_shop(user_id: str, car_id: str, auth_uid: AuthUid = None):
             "wishlisted": entry["id"] in wished_ids,
         }
 
-    # The browsable catalog: recommendable sponsor products + generic mod
-    # categories. Non-recommendable ad campaigns are not upgrades.
-    rows = [row(e) for e in CATALOG if e["recommendable"] or not e["sponsored"]]
+    # The browsable catalog: specific installable sponsor products + generic
+    # mod categories. Non-recommendable ad campaigns, services, and broad
+    # product lines are not garage upgrades (the latter stay chat-only).
+    rows = [row(e) for e in CATALOG
+            if (e["recommendable"] and e.get("specific")) or not e["sponsored"]]
     candidates = [r for r in rows
                   if r["sponsored"] and not r["installed"] and not r["wishlisted"]]
     # wishlist gaps: categories the build or the wishlist already fills
