@@ -46,7 +46,7 @@ async def test_portrait_and_stats_stable_across_visits():
             g1 = (await client.get(f"/garage/{user_id}")).json()
             stats = g1["profile"]["cars"][0]["stats"]
             assert stats and stats["fp"] == _stats_fp(car), stats
-            assert not stats.get("modified")  # no mods -> stock build
+            assert "modified" not in stats  # stats are always the stock baseline
 
             # repeated visits: enrichment must no-op, nothing rewritten
             await asyncio.sleep(2)  # let the re-fired background task settle

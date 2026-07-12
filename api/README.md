@@ -25,12 +25,18 @@ uv run uvicorn app:app --port 8000
 - `POST /chat` with JSON `{"message": str, "user_id": str, "session_id": str}`
   (`session_id` optional — one per browser visit; omitted requests share a
   `"default"` session) → SSE stream:
-  1. `data: {"type": "tool", "name": "search_archive" | "web_search" | "check_recalls"}` —
+  1. `data: {"type": "tool", "name": "search_archive" | "web_search" | "check_recalls" | "recommend_products"}` —
      one event per tool call the agent makes (may be interleaved with tokens; zero or more)
   2. `data: {"type": "token", "text": "..."}` — one event per token as the model generates
-  3. `data: {"type": "citations", "citations": [{"title": "...", "url": "..."}]}` — the
+  3. `data: {"type": "ad", "product": str, "advertiser": str, "description": str, "image": url, "link": url, "sponsored": true, "deltas": {"power": int, ...} | null}` —
+     at most two per turn, only when the agent judged the question product-intent
+     and called `recommend_products`; `deltas` carries the five-stat change for
+     the user's first garage car's generation (null when no car is known).
+     `link` is the advertiser's click-through URL with its existing UTM
+     parameters; `image` is the hotlinked creative.
+  4. `data: {"type": "citations", "citations": [{"title": "...", "url": "..."}]}` — the
      articles actually retrieved this turn (empty list if no retrieval)
-  4. `data: [DONE]`
+  5. `data: [DONE]`
 
 - `GET /garage/{user_id}` →
   `{"profile": {...}, "instructions": [...], "summaries": [{"summary": str, "date": "YYYY-MM-DD"}, ...]}` —
@@ -46,16 +52,45 @@ uv run uvicorn app:app --port 8000
       "mods": ["..."], "wishlist": ["..."],
       "stats": {"power": 78, "acceleration": 76, "top_speed": 72,
                 "handling": 70, "braking": 72,
-                "hp": 435, "zero_to_sixty": 4.3, "top_speed_mph": 155}
+                "hp": 435, "zero_to_sixty": 4.3, "top_speed_mph": 155},
+      "bars": {"current": {"power": 80, "...": 0}, "dream": {"power": 95, "...": 0}}
     }],
     "goals": ["..."]
   }
   ```
 
   All car fields optional; `stats` is `null`/absent until the background
-  enrichment fills it (arcade-style 0–100 scores + real stock figures for
-  that year/trim, generated once by Sonnet and cached). Legacy flat
-  single-car profiles are migrated into `cars[0]` transparently on read.
+  enrichment fills it (arcade-style 0–100 scores + real figures for that
+  year/trim, generated once by Sonnet and cached — always the STOCK
+  baseline). `bars` is composed on read, never stored: `current` = stock
+  stats + the summed per-generation catalog deltas of recognized installed
+  mods, `dream` = current + wishlist deltas, both clamped 0–100.
+  Mods/wishlist entries resolve to catalog entries by normalized name/alias
+  matching; unrecognized free text contributes zero. Legacy flat single-car
+  profiles are migrated into `cars[0]` transparently on read.
+
+- `GET /garage/{user_id}/cars/{car_id}/shop` → the car's Upgrade Shop:
+
+  ```json
+  {
+    "recommended": [{ "...": "2-3 eligible sponsor products, best stat fit" }],
+    "catalog": [{
+      "id": "tremec-tremec-tkx-5-speed-manual-transmission",
+      "name": "...", "advertiser": "Tremec or null", "sponsored": true,
+      "description": "...", "categories": ["transmission"],
+      "image": "creative URL or null", "link": "UTM click-through or null",
+      "deltas": {"power": 0, "acceleration": 2, "...": 0},
+      "installed": false, "wishlisted": false
+    }]
+  }
+  ```
+
+  `catalog` is every recommendable sponsor product plus the unbranded
+  generic mod categories (no advertiser, no link); `deltas` are resolved for
+  this car's generation (null when unknown). The recommended strip excludes
+  products already installed/wishlisted and prefers categories the build
+  doesn't cover yet. "I have this" / "Add to wishlist" write through the
+  normal car PATCH below — this route only reads.
 
 - `GET /garage/{user_id}/cars/{car_id}/image` → the car's AI-generated
   portrait (`image/png`, `Cache-Control: public, max-age=86400`); 404 while
@@ -65,9 +100,11 @@ uv run uvicorn app:app --port 8000
 
 - `PATCH /garage/{user_id}/cars/{car_id}` with any subset of
   `{year, trim, generation, color, nickname, mods, wishlist}` → the updated
-  car. UI editing path: scalars overwrite (`null` clears), `mods`/`wishlist`
-  replace wholesale. Validation: year 1964–2027, strings length-capped.
-  Identity changes reset `stats` and queue portrait regeneration.
+  car (with composed `bars`). UI editing path: scalars overwrite (`null`
+  clears), `mods`/`wishlist` replace wholesale. Validation: year 1964–2027,
+  strings length-capped. Identity changes reset `stats` and queue portrait
+  regeneration; mods changes recompose the bars deterministically (no LLM)
+  and queue a portrait edit.
 
 - `DELETE /garage/{user_id}/cars/{car_id}` → 204; removes the car and its
   cached portrait.
@@ -117,6 +154,24 @@ uv run python -m ingest
 
 Pipeline details are in `ingest.py`'s docstring; the 21 excluded promo
 articles are documented in `EXCLUDED_ARTICLES.md`.
+
+### Ads ingestion
+
+Turns `../data/ads.csv` (the Webflow advertiser export, gitignored) into the
+committed product catalog in `ads_artifact/` — `catalog.jsonl` (sponsor
+products + generic mod categories, each with per-Mustang-generation stat
+deltas, aliases, creative URL, and UTM click-through link) and `vectors.npz`
+(row-aligned embeddings for the runtime hybrid index). Only website-active
+advertisers are ingested; each one's creatives are vision-analyzed by Sonnet
+to classify it (product vendor / service / event / charity / giveaway /
+placeholder) and extract products. Recommendation eligibility = active AND
+product-or-service vendor: the AdSense placeholder, charities, and giveaways
+are ingested but never recommended. Re-running against a fresh export is the
+roster-refresh path.
+
+```sh
+uv run python -m ingest_ads
+```
 
 ## Tests
 

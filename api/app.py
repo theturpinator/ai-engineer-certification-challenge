@@ -1,10 +1,14 @@
 """Ask MustangDriver chat API.
 
-FastAPI app: POST /chat streams SSE tokens + tool/citations events from a
-LangGraph ReAct agent with three tools: search_archive (in-memory Qdrant over
-index_artifact/, built at startup), web_search (Tavily, live web), and
-check_recalls (NHTSA Recalls API), plus two memory tools: update_garage
-(semantic: the user's cars, per-car mods/wishlist, user-level goals) and
+FastAPI app: POST /chat streams SSE tokens + tool/citations/ad events from a
+LangGraph ReAct agent with four tools: search_archive (in-memory Qdrant over
+index_artifact/, built at startup), web_search (Tavily, live web),
+check_recalls (NHTSA Recalls API), and recommend_products (intent-gated
+sponsored recommendations over the committed ads_artifact/ catalog via a
+mini BM25+dense RRF index; at most two `ad` events per turn, each carrying
+the creative image, UTM click-through link, Sponsored flag, and stat-delta
+chips for the user's car), plus two memory tools: update_garage (semantic:
+the user's cars, per-car mods/wishlist, user-level goals) and
 update_instructions (procedural: standing answer preferences), both keyed by
 user_id in Postgres and folded into the system prompt each turn. Episodic
 memory: after each turn a background task has Claude Haiku keep a rolling 2-3
@@ -12,11 +16,18 @@ sentence summary of the session (keyed by user_id + session_id from the
 client), and recent past-session summaries are injected into the system
 prompt. The garage holds multiple cars (profile.cars, legacy flat profiles
 migrate on read); each car is enriched in the background with arcade-style
-build-aware stats (Sonnet, cached in the car with a fingerprint) and an
-AI-generated portrait (gpt-image-1 via the gateway, cached in car_images with
-identity/build fingerprints). The portrait is canonical: identity changes
-(year/generation/trim) regenerate it; build changes (color/mods) EDIT the
-stored photo via gemini-2.5-flash-image, never re-rolling. GET
+STOCK-baseline stats (Sonnet, cached in the car with an identity
+fingerprint) and an AI-generated portrait (gpt-image-1 via the gateway,
+cached in car_images with identity/build fingerprints). The portrait is
+canonical: identity changes (year/generation/trim) regenerate it; build
+changes (color/mods) EDIT the stored photo via gemini-2.5-flash-image, never
+re-rolling. Bars compose deterministically from the committed catalog:
+current = stock + summed deltas of recognized installed mods, dream =
+current + wishlist deltas, both clamped 0-100 and returned by the garage
+read/write endpoints so clients never re-derive them. GET
+/garage/{user_id}/cars/{car_id}/shop serves the Upgrade Shop (recommended
+sponsor products + the full searchable catalog with per-car delta chips);
+its have-it/want-it actions write through the existing car PATCH. GET
 /garage/{user_id} returns everything known; cars are editable via
 PATCH/DELETE /garage/{user_id}/cars/{car_id}. Users can hold multiple chats:
 POST /chat takes an optional chat_id (thread_id = user_id:chat_id, the legacy
@@ -37,6 +48,7 @@ import json
 import os
 import re
 import uuid
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -63,6 +75,9 @@ from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, Field, StringConstraints
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
+from rank_bm25 import BM25Okapi
+
+from ingest_ads import STATS as BAR_STATS, embed_text
 
 API_DIR = Path(__file__).parent
 load_dotenv(API_DIR.parent / ".env")  # before any graph runs, so LangSmith traces
@@ -85,6 +100,12 @@ availability). Any answer built on web results MUST begin with "According to \
 a live web search" and cite the source pages.
 - check_recalls for safety-recall questions; report the official NHTSA \
 campaigns (component, summary, remedy, date), or that none were found.
+- recommend_products ONLY when the user is shopping for a part or upgrade, \
+asks for upgrade advice, or the answer naturally calls for a specific \
+product. Call it at most once per turn. Weave the fitting product(s) into \
+your answer, naming the advertiser behind each. NEVER call it on history, \
+spec, lore, recall, news, or any question that doesn't call for buying \
+something — those answers stay purely editorial, exactly as before.
 
 If no tool can answer, say so plainly rather than guessing.
 
@@ -389,6 +410,124 @@ def _autofill_generation(car: dict) -> None:
             car["generation"] = gen
 
 
+# --- Product catalog (committed by ingest_ads.py): sponsor products + generic
+# mod categories, each with per-generation stat deltas. Read-only at runtime;
+# every user sees the same numbers every time.
+
+with open(API_DIR / "ads_artifact" / "catalog.jsonl") as f:
+    CATALOG = [json.loads(line) for line in f]
+
+_GEN_KEYS = {re.sub(r"[^a-z0-9]", "", g.lower()): g for _lo, _hi, g in GENERATIONS}
+
+# Mini hybrid retrieval (BM25 + dense, RRF — the technique validated in the
+# retrieval experiments) over the RECOMMENDABLE catalog entries only: the
+# placeholder, charities, and giveaways are in the catalog but never in this
+# index. Entirely separate from the article index; no network at startup.
+AD_TOP_K = 2  # at most two sponsored cards per turn
+_RRF_K = 60
+_RECO_ROWS = [i for i, e in enumerate(CATALOG) if e["recommendable"]]
+_RECO = [CATALOG[i] for i in _RECO_ROWS]
+_RECO_VECTORS = np.load(API_DIR / "ads_artifact" / "vectors.npz")["vectors"][_RECO_ROWS]
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercase; keep decimal numbers ("5.0") and alnum runs ("s550") whole."""
+    return re.findall(r"\d+(?:\.\d+)+|[a-z0-9]+", text.lower())
+
+
+_RECO_BM25 = BM25Okapi([_tokenize(embed_text(e)) for e in _RECO]) if _RECO else None
+_RECO_BY_ID = {e["id"]: e for e in _RECO}
+
+
+async def _search_products(query: str) -> list[dict]:
+    """Top recommendable products for a query: reciprocal rank fusion of the
+    dense and BM25 rankings (k=60), like the archive hybrid retriever."""
+    if not _RECO:
+        return []
+    vector = np.asarray(await _embeddings.aembed_query(query), dtype=np.float32)
+    dense_ranking = list(np.argsort(-(_RECO_VECTORS @ vector)))
+    scores = _RECO_BM25.get_scores(_tokenize(query))
+    bm25_ranking = [i for i in np.argsort(-scores) if scores[i] > 0]
+    fused: dict[int, float] = defaultdict(float)
+    for ranking in (dense_ranking, bm25_ranking):
+        for rank, idx in enumerate(ranking):
+            fused[int(idx)] += 1.0 / (_RRF_K + rank + 1)
+    top = sorted(fused, key=fused.__getitem__, reverse=True)[:AD_TOP_K]
+    return [_RECO[i] for i in top]
+
+
+@tool
+async def recommend_products(query: str) -> str:
+    """Search the site's sponsor product catalog for a specific product to
+    recommend. Call this ONLY when the user is shopping for a part or
+    upgrade, asks for upgrade advice, or the answer naturally calls for a
+    product — never on history, spec, lore, recall, or other questions.
+    Returns a JSON list of sponsored products (name, advertiser, one-line
+    description). Weave the fitting one(s) into your answer, naming the
+    advertiser; the chat UI shows each as a Sponsored card automatically."""
+    hits = await _search_products(query)
+    return json.dumps(
+        [{"id": h["id"], "product": h["name"], "advertiser": h["advertiser"],
+          "description": h["description"]} for h in hits],
+        ensure_ascii=False,
+    )
+
+
+def _gen_key(generation) -> str | None:
+    """A car's generation string mapped to its catalog deltas key ("fox body",
+    "Fox-body", "foxbody" all resolve); None when unrecognized."""
+    return _GEN_KEYS.get(re.sub(r"[^a-z0-9]", "", str(generation or "").lower()))
+
+
+def _norm_words(text) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+
+
+def _match_entry(text: str, catalog: list[dict] | None = None) -> dict | None:
+    """The catalog entry a free-text mod/wishlist item refers to, or None.
+    Whole-word name/alias match; the longest (most specific) alias wins, so
+    "cold air intake" beats "intake". Unrecognized free text matches nothing
+    and simply contributes zero to the bars."""
+    haystack = f" {_norm_words(text)} "
+    best, best_len = None, 0
+    for entry in CATALOG if catalog is None else catalog:
+        for alias in (entry["name"], *entry.get("aliases", [])):
+            a = _norm_words(alias)
+            if len(a) > best_len and f" {a} " in haystack:
+                best, best_len = entry, len(a)
+    return best
+
+
+def _sum_deltas(items, gen_key: str | None,
+                catalog: list[dict] | None = None) -> dict:
+    """Summed per-stat deltas of the recognized entries in a mod/wishlist."""
+    total = {s: 0 for s in BAR_STATS}
+    for item in items or []:
+        entry = _match_entry(item, catalog)
+        if entry and gen_key:
+            gen_deltas = entry["deltas"].get(gen_key, {})
+            for s in BAR_STATS:
+                total[s] += gen_deltas.get(s, 0)
+    return total
+
+
+def _compose_bars(car: dict, catalog: list[dict] | None = None) -> dict | None:
+    """Deterministic stat bars: current = stock LLM baseline + summed deltas
+    of recognized installed mods; dream = current + summed wishlist deltas.
+    Both clamped 0-100. None until the stock baseline exists."""
+    stats = car.get("stats")
+    if not stats:
+        return None
+    gen = _gen_key(car.get("generation"))
+    installed = _sum_deltas(car.get("mods"), gen, catalog)
+    wished = _sum_deltas(car.get("wishlist"), gen, catalog)
+    current, dream = {}, {}
+    for s in BAR_STATS:
+        current[s] = max(0, min(100, int(stats.get(s) or 0) + installed[s]))
+        dream[s] = max(0, min(100, current[s] + wished[s]))
+    return {"current": current, "dream": dream}
+
+
 # --- Build fingerprints: what makes a portrait or stats block stale ---
 
 
@@ -404,8 +543,9 @@ def _build_fp(car: dict) -> str:
 
 
 def _stats_fp(car: dict) -> str:
-    """Identity + mods (color doesn't move numbers). Mismatch => recompute."""
-    return json.dumps({"identity": _car_desc(car), "mods": sorted(car.get("mods") or [])})
+    """Identity only: stats are the STOCK baseline; installed mods compose
+    deterministically via the catalog deltas, never via the LLM."""
+    return json.dumps({"identity": _car_desc(car)})
 
 
 def _portrait_action(stored: tuple[str | None, str | None] | None, car: dict) -> str:
@@ -427,34 +567,22 @@ Mustang described below, reply with ONLY this JSON object, no other text:
 The 0-100 values are arcade-racing-game ratings calibrated across the entire \
 Mustang range, 1964 to today: a 1974 Mustang II is roughly 15-25 power, a base \
 1990s V6 around 30-40, a 2015+ GT around 75-85, a 2020 Shelby GT500 is 95-100.
-{build_clause}
-hp, zero_to_sixty, and top_speed_mph must always be the STOCK factory figures \
-for this car, regardless of modifications."""
-
-STOCK_CLAUSE = "The car is completely stock (factory condition, no modifications); \
-rate it as such."
-MODDED_CLAUSE = """The car has these modifications installed: {mods}.
-The 0-100 ratings must reflect the CURRENT build: each modification moves the \
-ratings it affects up from the stock baseline (e.g. a supercharger raises power \
-and acceleration, a big brake kit raises braking, coilovers or sway bars raise \
-handling). Modifications that don't affect performance leave the ratings \
-unchanged."""
+The car is completely stock (factory condition, no modifications); rate it as \
+such. Installed modifications are scored separately and must NOT be reflected \
+here — every figure is the STOCK factory baseline."""
 
 
 async def _generate_stats(car: dict) -> dict | None:
+    """The car's STOCK baseline (mods compose on top via catalog deltas)."""
     desc = _car_desc(car)
     if not desc:
         return None
-    mods = sorted(car.get("mods") or [])
-    clause = MODDED_CLAUSE.format(mods=", ".join(mods)) if mods else STOCK_CLAUSE
-    resp = await _stats_llm.ainvoke(STATS_PROMPT.format(desc=desc, build_clause=clause))
+    resp = await _stats_llm.ainvoke(STATS_PROMPT.format(desc=desc))
     m = re.search(r"\{.*\}", resp.content, re.S)
     if not m:
         return None
     stats = json.loads(m.group())
     stats["fp"] = _stats_fp(car)  # cache key: recompute only when this drifts
-    if mods:
-        stats["modified"] = True
     return stats
 
 
@@ -676,7 +804,7 @@ async def update_garage(
                     target[k] = v
             _autofill_generation(target)
             if target.get("stats") and target["stats"].get("fp") != _stats_fp(target):
-                target["stats"] = None  # identity or mods changed -> recompute
+                target["stats"] = None  # identity changed -> recompute stock baseline
         if goals:
             current = profile.get("goals", [])
             profile["goals"] = current + [g for g in goals if g not in current]
@@ -766,7 +894,8 @@ async def lifespan(app: FastAPI):
                 base_url=GATEWAY_URL,
                 api_key=os.environ["AI_GATEWAY_API_KEY"],
             ),
-            [search_archive, web_search, check_recalls, update_garage, update_instructions],
+            [search_archive, web_search, check_recalls, recommend_products,
+             update_garage, update_instructions],
             prompt=_prompt,
             checkpointer=saver,
         )
@@ -900,6 +1029,9 @@ async def garage(user_id: str, auth_uid: AuthUid = None):
         # opportunistic fire-and-forget: fills stats/portraits missed earlier;
         # _enrich_garage no-ops cheaply when everything is current
         asyncio.get_running_loop().create_task(_enrich_garage(user_id))
+        # composed current/dream bars ride along so clients never re-derive them
+        profile = {**profile,
+                   "cars": [{**c, "bars": _compose_bars(c)} for c in profile["cars"]]}
     return {
         "profile": profile,
         "instructions": instructions,
@@ -924,6 +1056,52 @@ async def car_image(user_id: str, car_id: str, auth_uid: AuthUid = None):
         media_type="image/png",
         headers={"Cache-Control": "public, max-age=86400"},
     )
+
+
+@app.get("/garage/{user_id}/cars/{car_id}/shop")
+async def upgrade_shop(user_id: str, car_id: str, auth_uid: AuthUid = None):
+    """The car's Upgrade Shop: a recommended strip of 2-3 eligible sponsor
+    products (category fit against this car's generation, current mods, and
+    wishlist gaps) plus the full catalog — sponsor products and generic mod
+    categories — each row carrying the five delta chips for this car's
+    generation. The have-it/want-it actions write through the existing
+    car PATCH endpoint; this route only reads."""
+    user_id = auth_uid or user_id
+    async with await _db() as conn:
+        profile = await _load_profile(conn, user_id)
+    car = next((c for c in profile.get("cars", []) if c["id"] == car_id), None)
+    if car is None:
+        raise HTTPException(404, "car not found")
+    gen = _gen_key(car.get("generation"))
+    owned = [e for e in (_match_entry(m) for m in car.get("mods") or []) if e]
+    wished = [e for e in (_match_entry(w) for w in car.get("wishlist") or []) if e]
+    owned_ids = {e["id"] for e in owned}
+    wished_ids = {e["id"] for e in wished}
+
+    def row(entry: dict) -> dict:
+        return {
+            "id": entry["id"], "name": entry["name"],
+            "advertiser": entry["advertiser"], "sponsored": entry["sponsored"],
+            "description": entry["description"], "categories": entry["categories"],
+            "image": entry["image"], "link": entry["link"],
+            "deltas": entry["deltas"].get(gen) if gen else None,
+            "installed": entry["id"] in owned_ids,
+            "wishlisted": entry["id"] in wished_ids,
+        }
+
+    # The browsable catalog: recommendable sponsor products + generic mod
+    # categories. Non-recommendable ad campaigns are not upgrades.
+    rows = [row(e) for e in CATALOG if e["recommendable"] or not e["sponsored"]]
+    candidates = [r for r in rows
+                  if r["sponsored"] and not r["installed"] and not r["wishlisted"]]
+    # wishlist gaps: categories the build or the wishlist already fills
+    covered = {c for e in owned + wished for c in e.get("categories", [])}
+    fit = [r for r in candidates if not (set(r["categories"]) & covered)] or candidates
+
+    def gain(r: dict) -> int:
+        return sum(r["deltas"].values()) if r["deltas"] else 0
+
+    return {"recommended": sorted(fit, key=gain, reverse=True)[:3], "catalog": rows}
 
 
 Str80 = Annotated[str, StringConstraints(strip_whitespace=True, max_length=80)]
@@ -977,7 +1155,7 @@ async def create_car(user_id: str, body: CarCreate, background_tasks: Background
             (user_id, Json(profile)),
         )
     background_tasks.add_task(_enrich_garage, user_id)
-    return car
+    return {**car, "bars": _compose_bars(car)}
 
 
 @app.patch("/garage/{user_id}/cars/{car_id}")
@@ -997,13 +1175,13 @@ async def patch_car(user_id: str, car_id: str, patch: CarPatch,
                 target[k] = v
         _autofill_generation(target)
         if target.get("stats") and target["stats"].get("fp") != _stats_fp(target):
-            target["stats"] = None  # identity or mods changed -> recompute
+            target["stats"] = None  # identity changed -> recompute stock baseline
         await conn.execute(
             "UPDATE garage SET profile = %s WHERE user_id = %s",
             (Json(profile), user_id),
         )
     background_tasks.add_task(_enrich_garage, user_id)
-    return target
+    return {**target, "bars": _compose_bars(target)}
 
 
 @app.delete("/garage/{user_id}/cars/{car_id}", status_code=204)
@@ -1118,6 +1296,10 @@ async def chat(req: ChatRequest, auth_uid: AuthUid = None):
 
     async def sse():
         citations, seen = [], set()
+        ads_sent = 0  # hard cap regardless of how often the tool fires
+        # ponytail: "active car" = first garage car; pass a car_id in
+        # ChatRequest if multi-car users ever need per-chat targeting
+        active_gen = _gen_key((profile.get("cars") or [{}])[0].get("generation"))
         stream = _agent.astream(
             {"messages": [{"role": "user", "content": req.message}]},
             {"configurable": {
@@ -1135,6 +1317,24 @@ async def chat(req: ChatRequest, auth_uid: AuthUid = None):
                         if hit["url"] not in seen:
                             seen.add(hit["url"])
                             citations.append({"title": hit["title"], "url": hit["url"]})
+                elif msg.name == "recommend_products":
+                    for item in json.loads(msg.content):
+                        entry = _RECO_BY_ID.get(item["id"])
+                        if not entry or ads_sent >= AD_TOP_K:
+                            continue
+                        ads_sent += 1
+                        ad = {
+                            "type": "ad",
+                            "product": entry["name"],
+                            "advertiser": entry["advertiser"],
+                            "description": entry["description"],
+                            "image": entry["image"],
+                            "link": entry["link"],
+                            "sponsored": True,
+                            "deltas": entry["deltas"].get(active_gen)
+                            if active_gen else None,
+                        }
+                        yield f"data: {json.dumps(ad)}\n\n"
             elif isinstance(msg, AIMessageChunk) and isinstance(msg.content, str) and msg.content:
                 answer_parts.append(msg.content)
                 yield f"data: {json.dumps({'type': 'token', 'text': msg.content})}\n\n"

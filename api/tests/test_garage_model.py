@@ -118,7 +118,9 @@ def test_build_fp_order_and_case_insensitive():
     assert _build_fp(a) == _build_fp(b)  # sorted mods, normalized color
 
 
-def test_stats_fp_tracks_identity_and_mods_not_color():
+def test_stats_fp_tracks_identity_only():
+    """Stats are the STOCK baseline: mods compose via catalog deltas (issue
+    #20), so neither color nor mods may trigger an LLM stats recompute."""
     assert _stats_fp(CAR) == _stats_fp({**CAR, "color": "green"})
-    assert _stats_fp(CAR) != _stats_fp({**CAR, "mods": ["supercharger"]})
+    assert _stats_fp(CAR) == _stats_fp({**CAR, "mods": ["supercharger"]})
     assert _stats_fp(CAR) != _stats_fp({**CAR, "year": 1969})

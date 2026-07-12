@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { apiFetch, AuthButton } from "../auth";
+import { DeltaChips, type Deltas } from "../chips";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -15,8 +16,8 @@ type Stats = {
   hp?: number;
   zero_to_sixty?: number;
   top_speed_mph?: number;
-  modified?: boolean;
 };
+type Bars = { current: Record<string, number>; dream: Record<string, number> };
 type Car = {
   id: string;
   year?: number | string;
@@ -27,6 +28,7 @@ type Car = {
   mods?: string[];
   wishlist?: string[];
   stats?: Stats | null;
+  bars?: Bars | null;
 };
 type Profile = { cars?: Car[]; goals?: string[] };
 type Garage = {
@@ -113,7 +115,7 @@ function Portrait({ url }: { url: string }) {
   );
 }
 
-function StatBars({ stats }: { stats: Stats }) {
+function StatBars({ stats, bars }: { stats: Stats; bars?: Bars | null }) {
   const figures = [
     stats.hp != null && `${stats.hp} hp`,
     stats.zero_to_sixty != null && `0–60 in ${stats.zero_to_sixty}s`,
@@ -121,27 +123,183 @@ function StatBars({ stats }: { stats: Stats }) {
   ]
     .filter(Boolean)
     .join(" · ");
+  let anyDream = false;
+  const rows = BARS.map(([key, label]) => {
+    const stock = Math.max(0, Math.min(100, Number(stats[key]) || 0));
+    const current = bars?.current?.[key] ?? stock;
+    const dream = Math.max(bars?.dream?.[key] ?? current, current);
+    if (dream > current) anyDream = true;
+    return (
+      <div className="stat" key={key}>
+        <span className="label">{label}</span>
+        <div className="bar">
+          {dream > current && (
+            <div className="dreamfill" style={{ width: `${dream}%` }} />
+          )}
+          <div className="fill" style={{ width: `${current}%` }} />
+        </div>
+        <span className="num">
+          {current}
+          {dream > current && <span className="dreamnum"> →{dream}</span>}
+        </span>
+      </div>
+    );
+  });
   return (
     <>
       {figures && <p className="figures">Stock: {figures}</p>}
-      <div className="stats">
-        {BARS.map(([key, label]) => {
-          const v = Math.max(0, Math.min(100, Number(stats[key]) || 0));
-          return (
-            <div className="stat" key={key}>
-              <span className="label">{label}</span>
-              <div className="bar">
-                <div style={{ width: `${v}%` }} />
-              </div>
-              <span className="num">{v}</span>
-            </div>
-          );
-        })}
-      </div>
-      {stats.modified && (
-        <p className="empty">Ratings reflect this car’s installed mods.</p>
+      <div className="stats">{rows}</div>
+      {anyDream && (
+        <p className="empty">
+          Solid bar: current build · light extension: with your wishlist.
+        </p>
       )}
     </>
+  );
+}
+
+type ShopRow = {
+  id: string;
+  name: string;
+  advertiser: string | null;
+  sponsored: boolean;
+  description: string;
+  categories: string[];
+  image: string | null;
+  link: string | null;
+  deltas: Deltas | null;
+  installed: boolean;
+  wishlisted: boolean;
+};
+
+function ShopRowView({
+  row,
+  busy,
+  onAct,
+}: {
+  row: ShopRow;
+  busy: boolean;
+  onAct: (row: ShopRow, field: "mods" | "wishlist") => void;
+}) {
+  return (
+    <div className="shoprow">
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      {row.image && <img src={row.image} alt={`${row.advertiser} ad`} />}
+      <div className="shopinfo">
+        {row.sponsored && (
+          <span className="sponsoredtag">Sponsored · {row.advertiser}</span>
+        )}
+        {row.link ? (
+          <a href={row.link} target="_blank" rel="noopener noreferrer sponsored">
+            <strong>{row.name}</strong>
+          </a>
+        ) : (
+          <strong>{row.name}</strong>
+        )}
+        <p>{row.description}</p>
+        <DeltaChips deltas={row.deltas} />
+        <div className="shopactions">
+          <button
+            type="button"
+            disabled={row.installed || busy}
+            onClick={() => onAct(row, "mods")}
+          >
+            {row.installed ? "✓ Installed" : "I have this"}
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            disabled={row.wishlisted || row.installed || busy}
+            onClick={() => onAct(row, "wishlist")}
+          >
+            {row.wishlisted ? "✓ On wishlist" : "Add to wishlist"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function UpgradeShop({
+  uid,
+  car,
+  onCarUpdated,
+}: {
+  uid: string;
+  car: Car;
+  onCarUpdated: (car: Car) => void;
+}) {
+  const [shop, setShop] = useState<{ recommended: ShopRow[]; catalog: ShopRow[] } | null>(
+    null
+  );
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [busy, setBusy] = useState("");
+
+  useEffect(() => {
+    apiFetch(`${API_URL}/garage/${uid}/cars/${car.id}/shop`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then(setShop)
+      .catch(() => {});
+  }, [uid, car]);
+
+  async function act(row: ShopRow, field: "mods" | "wishlist") {
+    setBusy(row.id + field);
+    try {
+      const list = (field === "mods" ? car.mods : car.wishlist) ?? [];
+      const r = await apiFetch(`${API_URL}/garage/${uid}/cars/${car.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ [field]: [...list, row.name] }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      onCarUpdated(await r.json()); // bars + lists update immediately
+    } catch {
+      /* row stays actionable; the user can retry */
+    } finally {
+      setBusy("");
+    }
+  }
+
+  if (!shop) return null;
+  const q = query.trim().toLowerCase();
+  const filtered = shop.catalog.filter(
+    (r) =>
+      !q ||
+      [r.name, r.advertiser ?? "", r.description, ...r.categories]
+        .join(" ")
+        .toLowerCase()
+        .includes(q)
+  );
+  return (
+    <section className="card shop">
+      <h2>Upgrade Shop</h2>
+      {shop.recommended.length > 0 && (
+        <>
+          <p className="empty">Recommended for this car:</p>
+          {shop.recommended.map((row) => (
+            <ShopRowView key={row.id} row={row} busy={busy !== ""} onAct={act} />
+          ))}
+        </>
+      )}
+      <button type="button" className="shoptoggle" onClick={() => setOpen(!open)}>
+        {open ? "Hide the full catalog" : `Browse all upgrades (${shop.catalog.length})`}
+      </button>
+      {open && (
+        <>
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search upgrades…"
+            aria-label="Search upgrades"
+          />
+          {filtered.map((row) => (
+            <ShopRowView key={row.id} row={row} busy={busy !== ""} onAct={act} />
+          ))}
+          {filtered.length === 0 && <p className="empty">No upgrades match.</p>}
+        </>
+      )}
+    </section>
   );
 }
 
@@ -426,7 +584,7 @@ export default function GaragePage() {
                     url={`${API_URL}/garage/${uid}/cars/${car.id}/image?v=${imgVer}`}
                   />
                   {car.stats ? (
-                    <StatBars stats={car.stats} />
+                    <StatBars stats={car.stats} bars={car.bars} />
                   ) : (
                     <p className="empty">Crunching the numbers for this car…</p>
                   )}
@@ -441,6 +599,7 @@ export default function GaragePage() {
                   />
                 ) : (
                   <>
+                    <UpgradeShop uid={uid} car={car} onCarUpdated={onSaved} />
                     <ListSection title="Installed Mods" items={car.mods} />
                     <ListSection title="Wishlist" items={car.wishlist} />
                   </>

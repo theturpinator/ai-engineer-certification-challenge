@@ -4,12 +4,47 @@ import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import ReactMarkdown from "react-markdown";
 import { apiFetch, AuthButton } from "./auth";
+import { DeltaChips, type Deltas } from "./chips";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 type Citation = { title: string; url: string };
-type Message = { role: "user" | "assistant"; content: string; citations?: Citation[] };
+type Ad = {
+  product: string;
+  advertiser: string;
+  description: string;
+  image: string | null;
+  link: string | null;
+  sponsored: boolean;
+  deltas: Deltas | null;
+};
+type Message = {
+  role: "user" | "assistant";
+  content: string;
+  citations?: Citation[];
+  ads?: Ad[];
+};
 type ChatMeta = { chat_id: string; title: string; updated_at: string };
+
+function AdCard({ ad }: { ad: Ad }) {
+  return (
+    <a
+      className="adcard"
+      href={ad.link ?? undefined}
+      target="_blank"
+      rel="noopener noreferrer sponsored"
+    >
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      {ad.image && <img src={ad.image} alt={`${ad.advertiser} ad`} />}
+      <div className="adbody">
+        <span className="sponsoredtag">Sponsored · {ad.advertiser}</span>
+        <strong>{ad.product}</strong>
+        <p>{ad.description}</p>
+        <DeltaChips deltas={ad.deltas} />
+      </div>
+    </a>
+  );
+}
 
 const NewTabLink = (props: React.ComponentProps<"a">) => (
   <a {...props} target="_blank" rel="noopener noreferrer" />
@@ -311,6 +346,14 @@ export default function Chat() {
               const last = m[m.length - 1];
               return [...m.slice(0, -1), { ...last, citations: parsed.citations }];
             });
+          } else if (parsed.type === "ad") {
+            setMessages((m) => {
+              const last = m[m.length - 1];
+              return [
+                ...m.slice(0, -1),
+                { ...last, ads: [...(last.ads ?? []), parsed as Ad] },
+              ];
+            });
           }
         }
       }
@@ -392,6 +435,9 @@ export default function Chat() {
             ) : (
               msg.content
             )}
+            {msg.ads?.map((ad, j) => (
+              <AdCard key={j} ad={ad} />
+            ))}
             {msg.citations && (
               <div className="sources">
                 <strong>Sources</strong>
