@@ -264,11 +264,24 @@ Config (feature is hidden until set):
 
 Owner action: in Google Cloud Console create an **OAuth Client ID (Web application)** with authorized JavaScript origins `http://localhost:3000` and `https://ask-mustangdriver-web.vercel.app`, then set the three variables above (locally and in the Vercel projects).
 
+## Deploying to production
+
+One command, after the show-first ship gate (local build + screenshots + owner approval):
+
+```sh
+./deploy.sh
+```
+
+It deploys the API to Vercel production, health-checks `/health`, then deploys the web app and smoke-checks it — failing fast at each step. Needs a logged-in Vercel CLI and Node 18+ (when the shell default is older, it picks up the newest nvm-installed Node automatically). Both apps are already linked (`api/.vercel`, `web/.vercel`); `vercel link` re-creates the links if lost. Production URLs: [web](https://ask-mustangdriver-web.vercel.app) · [API](https://ask-mustangdriver-api.vercel.app).
+
 ## Repo layout
 
 ```
+deploy.sh       production deploy: api → health check → web → smoke check
+AGENTS.md       operating guide for coding agents (CLAUDE.md symlinks to it)
 api/            FastAPI backend: agent, tools, memory, ingestion, tests
   index_artifact/   committed chunks + vectors (the corpus ships pre-embedded)
+  ads_artifact/     committed advertiser product catalog + vectors
   EXCLUDED_ARTICLES.md   promo-exclusion rule + full list of 21
 evals/          RAGAS harness, datasets, experiments notebook, results
   results/          per-variant aggregates + comparison.md
