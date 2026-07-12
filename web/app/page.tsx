@@ -436,12 +436,10 @@ export default function Chat() {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      // Bubble segmentation (issue #39): the first token after a completed
-      // tool starts a fresh assistant bubble — but only when the current
-      // bubble already has content, so a no-preamble tool call never leaves
-      // an empty bubble behind. SSE contract unchanged.
+      // Text streamed before a tool event is search narration ("Let me
+      // search…"), not answer — drop it when the tool fires (issue #45).
+      // Only the post-last-tool segment survives as the answer bubble.
       let bubbleText = ""; // what has streamed into the current bubble
-      let toolDone = false; // a tool finished since the last token
       // Ads arrive mid-stream, right after their tool event. Hold every one
       // until the stream completes, then attach to the trailing (answer)
       // bubble — below the finished text — so cards never interleave with
@@ -458,16 +456,6 @@ export default function Chat() {
           if (data === "[DONE]") continue;
           const parsed = JSON.parse(data);
           if (parsed.type === "token") {
-            if (toolDone && bubbleText) {
-              // close the preamble bubble (status included) and answer fresh
-              updateThread(k, (msgs) => [
-                ...msgs.slice(0, -1),
-                { ...msgs[msgs.length - 1], status: undefined },
-                { role: "assistant" as const, content: "" },
-              ]);
-              bubbleText = "";
-            }
-            toolDone = false;
             bubbleText += parsed.text;
             patchLast(k, (last) => ({
               ...last,
@@ -475,7 +463,11 @@ export default function Chat() {
               content: last.content + parsed.text,
             }));
           } else if (parsed.type === "tool") {
-            toolDone = true; // the next token opens the answer bubble
+            if (bubbleText) {
+              // wipe the narration that streamed ahead of this tool call
+              patchLast(k, (last) => ({ ...last, content: "" }));
+              bubbleText = "";
+            }
           } else if (parsed.type === "tool_start") {
             patchLast(k, (last) => ({
               ...last,
@@ -512,8 +504,8 @@ export default function Chat() {
 
   function retry(text: string) {
     const k = chatKey(chatId);
-    // Drop the whole failed turn — every trailing assistant bubble (a tool
-    // split can leave several) plus its user message — then resend.
+    // Drop the whole failed turn — every trailing assistant bubble plus its
+    // user message — then resend.
     updateThread(k, (msgs) => {
       if (!msgs.length || !msgs[msgs.length - 1].error) return msgs;
       let i = msgs.length;
