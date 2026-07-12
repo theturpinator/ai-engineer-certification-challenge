@@ -1,7 +1,7 @@
 """POST /garage/{user_id}/cars (picker intake) — real Postgres, no LLM:
 enrichment is monkeypatched out (its real behavior is covered by
 test_portrait_stability.py); this checks validation, creation, generation
-derivation, persistence, and the duplicate 409."""
+derivation, persistence, the duplicate 409, and the 10-car cap (issue #35)."""
 
 import uuid
 
@@ -66,3 +66,42 @@ async def test_post_car_validation_creation_and_409(monkeypatch):
             )
             assert r.status_code == 201
             assert r.json()["generation"] == "First generation"
+
+
+@pytest.mark.asyncio
+async def test_ten_car_cap_and_delete_frees_a_slot(monkeypatch):
+    """Issue #35: the 11th car is a 400 with the garage-full message; deleting
+    one frees the slot so creation succeeds again."""
+
+    async def fake_enrich(uid):
+        pass
+
+    monkeypatch.setattr(app_module, "_enrich_garage", fake_enrich)
+    user_id = str(uuid.uuid4())
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            for year in range(2010, 2020):  # distinct years dodge the dup 409
+                r = await client.post(
+                    f"/garage/{user_id}/cars",
+                    json={"year": year, "trim": "GT", "color": "Red"},
+                )
+                assert r.status_code == 201, r.text
+
+            r = await client.post(
+                f"/garage/{user_id}/cars",
+                json={"year": 2020, "trim": "GT", "color": "Red"},
+            )
+            assert r.status_code == 400
+            assert r.json()["detail"] == "Garage is full — max 10 cars"
+
+            cars = (await client.get(f"/garage/{user_id}")).json()["profile"]["cars"]
+            assert len(cars) == 10
+            r = await client.delete(f"/garage/{user_id}/cars/{cars[0]['id']}")
+            assert r.status_code == 204
+
+            r = await client.post(
+                f"/garage/{user_id}/cars",
+                json={"year": 2020, "trim": "GT", "color": "Red"},
+            )
+            assert r.status_code == 201, r.text

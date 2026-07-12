@@ -1,8 +1,8 @@
 """Pure-function tests for the multi-car garage model: legacy migration,
-chat-driven car targeting, and the portrait/stats staleness fingerprints.
-No network, no DB."""
+chat-driven car targeting, the stats staleness fingerprint, and the
+seed-once-then-frozen portrait decision. No network, no DB."""
 
-from app import (_autofill_generation, _build_fp, _derive_generation, _identity_fp,
+from app import (_autofill_generation, _derive_generation,
                  _match_car, _migrate, _portrait_action, _stats_fp)
 
 
@@ -91,31 +91,21 @@ CAR = {"id": "aaa", "year": 2016, "generation": "S550", "trim": "GT",
        "color": "Race Red", "mods": ["cold air intake"]}
 
 
-def _stored(car):
-    return (_identity_fp(car), _build_fp(car))
-
-
-def test_portrait_action_generate_edit_skip():
-    assert _portrait_action(None, CAR) == "generate"  # no portrait yet
-    assert _portrait_action(_stored(CAR), CAR) == "skip"  # nothing changed
-
-    # mods-list change -> edit the stored photo, never re-roll
-    modded = {**CAR, "mods": CAR["mods"] + ["rear spoiler"]}
-    assert _portrait_action(_stored(CAR), modded) == "edit"
-    # mod removed -> also an edit
-    assert _portrait_action(_stored(modded), CAR) == "edit"
-
-    # color change -> edit; identity change -> full regeneration
-    assert _portrait_action(_stored(CAR), {**CAR, "color": "Grabber Blue"}) == "edit"
-    assert _portrait_action(_stored(CAR), {**CAR, "year": 1969}) == "generate"
-    assert _portrait_action(_stored(CAR), {**CAR, "trim": "EcoBoost"}) == "generate"
-    assert _portrait_action(_stored(CAR), {**CAR, "generation": "Fox"}) == "generate"
-
-
-def test_build_fp_order_and_case_insensitive():
-    a = {**CAR, "mods": ["spoiler", "intake"], "color": "race red"}
-    b = {**CAR, "mods": ["intake", "spoiler"], "color": "Race Red "}
-    assert _build_fp(a) == _build_fp(b)  # sorted mods, normalized color
+def test_portrait_action_seeds_once_then_frozen():
+    """Issue #34: exactly one generation per car — when no image row exists
+    (and thus no user upload). Any existing row, whatever its fingerprints
+    or origin, is a no-op, and no input can ever yield an edit verdict."""
+    assert _portrait_action(None) == "generate"  # no portrait yet -> the seed
+    stored_rows = [
+        ("cartoon-v1|2016 S550 GT", '{"color": "race red", "mods": []}'),
+        ("stale-identity-fp", "stale-build-fp"),  # fingerprints drifted: still frozen
+        (None, None),  # pre-fingerprint row
+        ("user", "upload"),  # user photo row
+    ]
+    for stored in stored_rows:
+        assert _portrait_action(stored) == "skip", stored
+    for stored in [None, *stored_rows]:
+        assert _portrait_action(stored) in ("generate", "skip")  # never "edit"
 
 
 def test_stats_fp_tracks_identity_only():

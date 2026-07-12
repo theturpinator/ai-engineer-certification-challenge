@@ -1,6 +1,6 @@
 """Seam-1: portrait + stats stability — real Postgres, real gpt-image-1 and
-Sonnet via the gateway (one generation each; the mod/edit trigger logic is
-covered by the pure fingerprint tests in test_garage_model.py).
+Sonnet via the gateway (one generation each; the seed-once-then-frozen
+portrait decision is covered by the pure tests in test_garage_model.py).
 
 Seed a car directly in the garage table, let GET /garage's opportunistic
 enrichment fill in the portrait and stats, then assert repeated reads never

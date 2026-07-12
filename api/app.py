@@ -22,20 +22,24 @@ migrate on read); each car is enriched in the background with arcade-style
 STOCK-baseline stats (Sonnet, critically calibrated, the safety score
 grounded in the car's public NHTSA 5-Star overall rating when one exists —
 carried in stats.nhtsa for the UI to link — validated before caching, and
-cached in the car with an identity fingerprint) and an AI-generated cartoon
-portrait (gpt-image-1 via the gateway, cached in car_images with
-identity/build fingerprints). The portrait is canonical: identity changes
-(year/generation/trim) regenerate it; build changes (color/mods) EDIT the
-stored image via gemini-2.5-flash-image, never re-rolling. PUT
-/garage/{user_id}/cars/{car_id}/image (raw image bytes, <=8 MB) replaces the
-portrait with the user's own photo, which enrichment never overwrites. Bars compose deterministically from the committed catalog:
+cached in the car with an identity fingerprint) and a one-time AI-generated
+cartoon portrait (gpt-image-1 via the gateway, cached in car_images). The
+portrait is seeded exactly once, at car creation, then frozen forever: no
+identity, color, or mod change ever spends another image-model call (issue
+#34). PUT /garage/{user_id}/cars/{car_id}/image (raw image bytes, <=8 MB)
+replaces the portrait with the user's own photo, which is canonical and
+never overwritten. Garages are capped at 10 cars on BOTH creation paths
+(POST /garage/{user_id}/cars returns 400 "Garage is full — max 10 cars"; the
+chat update_garage tool returns the same message for the agent to relay);
+over-cap garages are grandfathered (issue #35). Bars compose deterministically from the committed catalog:
 current = stock + summed deltas of recognized installed mods, dream =
 current + wishlist deltas, both clamped 0-100 and returned by the garage
 read/write endpoints so clients never re-derive them. GET
 /garage/{user_id}/cars/{car_id}/shop serves the Upgrade Shop (recommended
 sponsor products + the full searchable catalog with per-car delta chips);
 its have-it/want-it actions write through the existing car PATCH. GET
-/garage/{user_id} returns everything known; cars are editable via
+/garage/{user_id} returns everything known (each car carries composed bars
+plus photo_uploaded, which drives the upload-pill UI); cars are editable via
 PATCH/DELETE /garage/{user_id}/cars/{car_id}. Users can hold multiple chats:
 POST /chat takes an optional chat_id (thread_id = user_id:chat_id, the legacy
 "default" chat keeps the bare user_id thread), GET /chats/{user_id} lists
@@ -252,6 +256,13 @@ async def _db() -> psycopg.AsyncConnection:
 
 LEGACY_CAR_FIELDS = ("year", "trim", "generation", "mods", "wishlist")
 CAR_MATCH_FIELDS = ("year", "trim", "generation", "nickname", "color")
+
+# Hard ceiling on per-user portrait-seeding spend (issue #35). Enforced on
+# BOTH creation paths (picker endpoint and the chat tool, which appends to the
+# profile directly); users already over the cap are grandfathered — the check
+# only blocks NEW cars.
+MAX_CARS = 10
+GARAGE_FULL_MSG = "Garage is full — max 10 cars"
 
 
 def _migrate(profile: dict) -> dict:
@@ -596,20 +607,7 @@ def _compose_bars(car: dict, catalog: list[dict] | None = None) -> dict | None:
     return {"current": current, "dream": dream}
 
 
-# --- Build fingerprints: what makes a portrait or stats block stale ---
-
-
-def _identity_fp(car: dict) -> str:
-    """Core identity (year/generation/trim) plus the portrait style version.
-    Mismatch => portrait regenerated (the style tag bump moved every existing
-    photoreal portrait to the cartoon look, issue #30)."""
-    return "cartoon-v1|" + _car_desc(car)
-
-
-def _build_fp(car: dict) -> str:
-    """Visual build (color + mods). Mismatch => stored portrait gets EDITED."""
-    return json.dumps({"color": str(car.get("color") or "").strip().lower(),
-                       "mods": sorted(car.get("mods") or [])})
+# --- Staleness: stats recompute on identity drift; portraits never do ---
 
 
 def _stats_fp(car: dict) -> str:
@@ -621,14 +619,13 @@ def _stats_fp(car: dict) -> str:
     return json.dumps({"identity": _car_desc(car), "v": 3})
 
 
-def _portrait_action(stored: tuple[str | None, str | None] | None, car: dict) -> str:
-    """'generate' | 'edit' | 'skip' for a car given the stored portrait's
-    (identity_fp, build_fp), or None when no portrait exists yet."""
-    if stored is None or stored[0] != _identity_fp(car):
-        return "generate"
-    if stored[1] != _build_fp(car):
-        return "edit"
-    return "skip"
+def _portrait_action(stored) -> str:
+    """'generate' | 'skip' for a car given its stored portrait row (None when
+    no portrait exists yet). The portrait is seeded exactly once — when no row
+    exists — then frozen forever: ANY existing row (generated or user-uploaded,
+    fingerprints current or drifted) is a no-op, and there is no edit verdict.
+    Image spend is thus bounded at one generation per car (issue #34)."""
+    return "skip" if stored is not None else "generate"
 
 
 STATS_PROMPT = """You are a critical automotive reviewer, not a salesman. For \
@@ -744,8 +741,10 @@ def _image_prompt(car: dict) -> str:
 
 
 async def _generate_image(user_id: str, car: dict) -> None:
-    """From-scratch portrait (gpt-image-1): only for a car with no portrait yet
-    or whose core identity changed. Stores both fingerprints alongside it."""
+    """The car's one seed portrait (gpt-image-1), for a car with no portrait
+    row at all. DO NOTHING on conflict: if a row appeared mid-generation (a
+    user upload, or a concurrent seed) that row wins — a generated image must
+    never overwrite anything (issues #31, #34)."""
     prompt = _image_prompt(car)
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -759,105 +758,25 @@ async def _generate_image(user_id: str, car: dict) -> None:
     image = base64.b64decode(resp.json()["data"][0]["b64_json"])
     async with await _db() as conn:
         await conn.execute(
-            "INSERT INTO car_images (user_id, car_id, image, prompt, identity_fp, build_fp) "
-            "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (user_id, car_id) DO UPDATE "
-            "SET image = EXCLUDED.image, prompt = EXCLUDED.prompt, "
-            "identity_fp = EXCLUDED.identity_fp, build_fp = EXCLUDED.build_fp",
-            (user_id, car["id"], image, prompt, _identity_fp(car), _build_fp(car)),
-        )
-
-
-def _edit_prompt(old_build_fp: str, car: dict) -> str:
-    """Describe the DELTA between the stored portrait's build and the current
-    one (mods added/removed, color change) as a photo-edit instruction."""
-    old = json.loads(old_build_fp)
-    mods = sorted(car.get("mods") or [])
-    color = str(car.get("color") or "").strip().lower()
-    parts = []
-    color_changed = color != old.get("color", "")
-    if color_changed:
-        parts.append(f"repaint the car {car['color']}" if car.get("color")
-                     else "repaint the car in a factory color for this model")
-    added = [m for m in mods if m not in old.get("mods", [])]
-    removed = [m for m in old.get("mods", []) if m not in mods]
-    if added:
-        parts.append("represent these newly installed modifications where visible: "
-                     + ", ".join(added))
-    if removed:
-        parts.append("remove these modifications, restoring those areas to stock: "
-                     + ", ".join(removed))
-    keep = "angle, lighting, and background" if color_changed else \
-        "color, angle, lighting, and background"
-    return (
-        "Edit this cartoon illustration: " + "; ".join(parts) + ". If a "
-        "modification is not externally visible, leave the image unchanged in "
-        f"that respect. Keep the cartoon style and the car, {keep} otherwise "
-        "identical."
-    )
-
-
-async def _edit_image(user_id: str, car: dict, old_build_fp: str, image: bytes) -> None:
-    """Apply a build change as an EDIT to the stored portrait via
-    gemini-2.5-flash-image. On any failure the old portrait is kept."""
-    prompt = _edit_prompt(old_build_fp, car)
-    b64 = base64.b64encode(image).decode()
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{GATEWAY_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {os.environ['AI_GATEWAY_API_KEY']}"},
-            json={"model": "google/gemini-2.5-flash-image", "messages": [{
-                "role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                ]}]},
-            timeout=300,
-        )
-    resp.raise_for_status()
-    images = resp.json()["choices"][0]["message"].get("images") or []
-    if not images:  # keep the old portrait; a later build change retries
-        print(f"portrait edit returned no image for {user_id}/{car['id']}")
-        return
-    url = images[0]["image_url"]["url"]
-    edited = base64.b64decode(url.split("base64,", 1)[1])
-    async with await _db() as conn:
-        await conn.execute(
-            "UPDATE car_images SET image = %s, build_fp = %s "
-            "WHERE user_id = %s AND car_id = %s",
-            (edited, _build_fp(car), user_id, car["id"]),
+            "INSERT INTO car_images (user_id, car_id, image, prompt) "
+            "VALUES (%s, %s, %s, %s) ON CONFLICT (user_id, car_id) DO NOTHING",
+            (user_id, car["id"], image, prompt),
         )
 
 
 async def _sync_portrait(user_id: str, car: dict) -> None:
-    """Bring the stored portrait up to date with the car: generate from scratch
-    when missing or the identity changed, EDIT the stored image when only the
-    build (color/mods) changed, otherwise leave the bytes untouched. A photo
-    the user uploaded is canonical and never overwritten (issue #31)."""
+    """Seed the car's portrait when none exists; any existing row (generated
+    or user-uploaded) freezes it forever — no identity, color, or mod change
+    ever spends another image-model call (issue #34)."""
     async with await _db() as conn:
         row = await (
             await conn.execute(
-                "SELECT prompt, identity_fp, build_fp, image, user_uploaded "
-                "FROM car_images WHERE user_id = %s AND car_id = %s",
+                "SELECT 1 FROM car_images WHERE user_id = %s AND car_id = %s",
                 (user_id, car["id"]),
             )
         ).fetchone()
-    if row and row[4]:
-        return  # the user's own photo wins over anything we'd generate
-    if row and row[1] is None:  # pre-fingerprint row: adopt it, never re-roll
-        if row[0] == _image_prompt(car):
-            async with await _db() as conn:
-                await conn.execute(
-                    "UPDATE car_images SET identity_fp = %s, build_fp = %s "
-                    "WHERE user_id = %s AND car_id = %s",
-                    (_identity_fp(car), _build_fp(car), user_id, car["id"]),
-                )
-            return
-        row = None  # identity/color drifted while unfingerprinted -> regenerate
-    action = _portrait_action((row[1], row[2]) if row else None, car)
-    if action == "generate":
+    if _portrait_action(row) == "generate":
         await _generate_image(user_id, car)
-    elif action == "edit":
-        await _edit_image(user_id, car, row[2], bytes(row[3]))
 
 
 async def _save_car_stats(user_id: str, car_id: str, stats: dict) -> None:
@@ -949,21 +868,25 @@ async def update_garage(
     removals = {k: v for k, v in dict(mods=remove_mods,
                                       wishlist=remove_wishlist).items() if v}
     missed: list[str] = []
+    full = False
     async with await _db() as conn:
         # ponytail: read-merge-write, no row lock; fine for one-user-per-thread chat
         profile = await _load_profile(conn, user_id)
         cars = profile.setdefault("cars", [])
         if updates or car or removals:
             target = _match_car(cars, car, updates)
-            if target is None:
-                if not updates:  # removal-only for a car we don't have
-                    return "No matching car in the garage; nothing removed."
-                target = {"id": uuid.uuid4().hex[:8]}
-                cars.append(target)
-            missed = _apply_car_updates(target, updates, removals)
-            _autofill_generation(target)
-            if target.get("stats") and target["stats"].get("fp") != _stats_fp(target):
-                target["stats"] = None  # identity changed -> recompute stock baseline
+            if target is None and not updates:  # removal-only, car unknown
+                return "No matching car in the garage; nothing removed."
+            if target is None and len(cars) >= MAX_CARS:
+                full = True  # skip the car; goals (if any) still merge below
+            else:
+                if target is None:
+                    target = {"id": uuid.uuid4().hex[:8]}
+                    cars.append(target)
+                missed = _apply_car_updates(target, updates, removals)
+                _autofill_generation(target)
+                if target.get("stats") and target["stats"].get("fp") != _stats_fp(target):
+                    target["stats"] = None  # identity changed -> recompute stock baseline
         if goals:
             current = profile.get("goals", [])
             profile["goals"] = current + [g for g in goals if g not in current]
@@ -972,6 +895,10 @@ async def update_garage(
             "ON CONFLICT (user_id) DO UPDATE SET profile = EXCLUDED.profile",
             (user_id, Json(profile)),
         )
+    if full:
+        return (f"{GARAGE_FULL_MSG}. The new car was NOT saved — tell the "
+                "user they must delete a car from their garage before "
+                "adding another.")
     if missed:
         return ("Garage profile updated, but these weren't in the garage "
                 f"(nothing removed): {', '.join(missed)}. Tell the user "
@@ -1025,19 +952,15 @@ async def lifespan(app: FastAPI):
                 "PRIMARY KEY (user_id, session_id))"
             )
             await conn.execute(
+                # existing installs may still carry identity_fp/build_fp
+                # columns from the retired portrait-edit path (issue #34);
+                # they're unused and harmless
                 "CREATE TABLE IF NOT EXISTS car_images ("
                 "user_id TEXT NOT NULL, car_id TEXT NOT NULL, "
                 "image BYTEA NOT NULL, prompt TEXT NOT NULL, "
-                "identity_fp TEXT, build_fp TEXT, "
                 "user_uploaded BOOLEAN NOT NULL DEFAULT FALSE, "
                 "content_type TEXT, "
                 "PRIMARY KEY (user_id, car_id))"
-            )
-            await conn.execute(  # pre-2.1 installs lack the fingerprint columns
-                "ALTER TABLE car_images ADD COLUMN IF NOT EXISTS identity_fp TEXT"
-            )
-            await conn.execute(
-                "ALTER TABLE car_images ADD COLUMN IF NOT EXISTS build_fp TEXT"
             )
             await conn.execute(  # user-photo columns (issue #31)
                 "ALTER TABLE car_images ADD COLUMN IF NOT EXISTS "
@@ -1225,9 +1148,21 @@ async def garage(user_id: str, auth_uid: AuthUid = None):
         # opportunistic fire-and-forget: fills stats/portraits missed earlier;
         # _enrich_garage no-ops cheaply when everything is current
         asyncio.get_running_loop().create_task(_enrich_garage(user_id))
-        # composed current/dream bars ride along so clients never re-derive them
+        async with await _db() as conn:
+            rows = await (
+                await conn.execute(
+                    "SELECT car_id FROM car_images "
+                    "WHERE user_id = %s AND user_uploaded",
+                    (user_id,),
+                )
+            ).fetchall()
+        uploaded = {r[0] for r in rows}
+        # composed current/dream bars ride along so clients never re-derive
+        # them; photo_uploaded drives the upload-pill visibility (issue #37)
         profile = {**profile,
-                   "cars": [{**c, "bars": _compose_bars(c)} for c in profile["cars"]]}
+                   "cars": [{**c, "bars": _compose_bars(c),
+                             "photo_uploaded": c["id"] in uploaded}
+                            for c in profile["cars"]]}
     return {
         "profile": profile,
         "instructions": instructions,
@@ -1372,6 +1307,8 @@ async def create_car(user_id: str, body: CarCreate, background_tasks: Background
     async with await _db() as conn:
         profile = await _load_profile(conn, user_id)
         cars = profile.setdefault("cars", [])
+        if len(cars) >= MAX_CARS:
+            raise HTTPException(400, GARAGE_FULL_MSG)
         # ponytail: same year+trim = same car -> 409; merging risks clobbering
         if any(str(c.get("year")) == str(car["year"])
                and str(c.get("trim", "")).lower() == car["trim"].lower()

@@ -65,7 +65,8 @@ uv run uvicorn app:app --port 8000
                 "hp": 435, "zero_to_sixty": 4.3, "top_speed_mph": 155,
                 "nhtsa": {"stars": 5, "vehicle": "2021 Ford Mustang 2 DR RWD",
                           "url": "https://www.nhtsa.gov/ratings"}},
-      "bars": {"current": {"power": 80, "...": 0}, "dream": {"power": 95, "...": 0}}
+      "bars": {"current": {"power": 80, "...": 0}, "dream": {"power": 95, "...": 0}},
+      "photo_uploaded": false
     }],
     "goals": ["..."]
   }
@@ -81,8 +82,17 @@ uv run uvicorn app:app --port 8000
   stats + the summed per-generation catalog deltas of recognized installed
   mods, `dream` = current + wishlist deltas, both clamped 0–100.
   Mods/wishlist entries resolve to catalog entries by normalized name/alias
-  matching; unrecognized free text contributes zero. Legacy flat single-car
-  profiles are migrated into `cars[0]` transparently on read.
+  matching; unrecognized free text contributes zero. `photo_uploaded` is true
+  once the owner has PUT their own photo (the UI hides the upload pill then).
+  Legacy flat single-car profiles are migrated into `cars[0]` transparently
+  on read.
+
+- `POST /garage/{user_id}/cars` with JSON
+  `{"year": int, "trim": str, "color": str, "nickname": str?}` → 201 + the
+  created car (generation derived from the year, enrichment queued in the
+  background). 409 when the same year+trim is already in the garage; 400
+  `"Garage is full — max 10 cars"` at the 10-car cap (also enforced on the
+  chat agent's add-car path; existing over-cap garages are grandfathered).
 
 - `GET /garage/{user_id}/cars/{car_id}/shop` → the car's Upgrade Shop:
 
@@ -111,8 +121,9 @@ uv run uvicorn app:app --port 8000
   stored content type, `image/png` for generated ones; `Cache-Control:
   public, max-age=86400`); 404 while generation is still pending. Portraits
   are cartoon illustrations generated in the background by
-  `openai/gpt-image-1` via the gateway, cached in the `car_images` table,
-  and regenerated when the car's year/generation/trim/color change.
+  `openai/gpt-image-1` via the gateway, cached in the `car_images` table.
+  Each car's portrait is generated exactly once — at creation — then frozen
+  forever; no later edit of any kind triggers another image-model call.
 
 - `PUT /garage/{user_id}/cars/{car_id}/image` with raw image bytes in the
   body (`Content-Type: image/*`, ≤8 MB) → 204; replaces the portrait with
@@ -125,9 +136,10 @@ uv run uvicorn app:app --port 8000
   car (with composed `bars`). UI editing path: scalars overwrite (`null`
   clears), `mods`/`wishlist` replace wholesale (deduped order-preserving,
   case-insensitive, so a retried add can't double-store). Validation: year
-  1964–2027, strings length-capped. Identity changes reset `stats` and queue
-  portrait regeneration; mods changes recompose the bars deterministically
-  (no LLM) and queue a portrait edit.
+  1964–2027, strings length-capped. Identity changes reset `stats` (the
+  stock baseline recomputes in the background); mods changes recompose the
+  bars deterministically (no LLM). The portrait never changes — frozen after
+  its one-time seed.
 
 - `DELETE /garage/{user_id}/cars/{car_id}` → 204; removes the car and its
   cached portrait.

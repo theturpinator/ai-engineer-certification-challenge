@@ -146,13 +146,17 @@ function AddCarModal({
         }),
       });
       if (r.status === 409) throw new Error("dup");
+      if (r.status === 400) throw new Error("full"); // 10-car cap (issue #35)
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       onAdded(await r.json());
     } catch (e) {
+      const kind = e instanceof Error ? e.message : "";
       setErr(
-        e instanceof Error && e.message === "dup"
+        kind === "dup"
           ? "That year and trim is already in your garage."
-          : "Couldn’t save — please try again."
+          : kind === "full"
+            ? "Garage is full — max 10 cars. Delete one in My Garage first."
+            : "Couldn’t save — please try again."
       );
       setSaving(false);
     }
@@ -250,6 +254,7 @@ export default function Chat() {
   const [chatId, setChatId] = useState("");
   const [picker, setPicker] = useState(false);
   const [carPrompt, setCarPrompt] = useState(false);
+  const [garageFull, setGarageFull] = useState(false);
   const userId = useRef<string>("");
   const sessionId = useRef<string>("");
   const streamingRef = useRef<Record<string, boolean>>({});
@@ -299,14 +304,18 @@ export default function Chat() {
     // "default" is the pre-multi-chat thread, so existing history shows up.
     setChatId(localStorage.getItem("md_chat_id") || "default");
     // Empty garage -> suggest the picker (once; dismissal sticks).
-    if (localStorage.getItem("md_addcar_prompt") !== "dismissed") {
-      apiFetch(`${API_URL}/garage/${id}`)
-        .then((r) => (r.ok ? r.json() : null))
-        .then((g) => {
-          if (g && !g.profile?.cars?.length) setCarPrompt(true);
-        })
-        .catch(() => {});
-    }
+    // Full garage -> the add-car chip gives way to a garage-full note (#35).
+    apiFetch(`${API_URL}/garage/${id}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((g) => {
+        if (!g) return;
+        const count = g.profile?.cars?.length ?? 0;
+        setGarageFull(count >= 10);
+        if (count === 0 && localStorage.getItem("md_addcar_prompt") !== "dismissed") {
+          setCarPrompt(true);
+        }
+      })
+      .catch(() => {});
   }, []);
 
   // The server transcript is the source of truth when (re)opening a chat —
@@ -406,6 +415,16 @@ export default function Chat() {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      // Bubble segmentation (issue #39): the first token after a completed
+      // tool starts a fresh assistant bubble — but only when the current
+      // bubble already has content, so a no-preamble tool call never leaves
+      // an empty bubble behind. SSE contract unchanged.
+      let bubbleText = ""; // what has streamed into the current bubble
+      let toolDone = false; // a tool finished since the last token
+      // Ads arrive right after the tool event — before the token that opens
+      // the answer bubble. Hold them so they attach to the answer, never the
+      // preamble (issue #39: "ads render under the answer bubble").
+      let heldAds: Ad[] = [];
       for (;;) {
         const { done, value } = await readWithTimeout(reader, WATCHDOG_MS);
         if (done) break;
@@ -417,11 +436,27 @@ export default function Chat() {
           if (data === "[DONE]") continue;
           const parsed = JSON.parse(data);
           if (parsed.type === "token") {
+            if (toolDone && bubbleText) {
+              // close the preamble bubble (status included) and answer fresh
+              updateThread(k, (msgs) => [
+                ...msgs.slice(0, -1),
+                { ...msgs[msgs.length - 1], status: undefined },
+                { role: "assistant" as const, content: "" },
+              ]);
+              bubbleText = "";
+            }
+            toolDone = false;
+            bubbleText += parsed.text;
+            const ads = heldAds;
+            heldAds = [];
             patchLast(k, (last) => ({
               ...last,
               status: undefined,
               content: last.content + parsed.text,
+              ads: ads.length ? [...(last.ads ?? []), ...ads] : last.ads,
             }));
+          } else if (parsed.type === "tool") {
+            toolDone = true; // the next token opens the answer bubble
           } else if (parsed.type === "tool_start") {
             patchLast(k, (last) => ({
               ...last,
@@ -430,15 +465,25 @@ export default function Chat() {
           } else if (parsed.type === "citations" && parsed.citations.length > 0) {
             patchLast(k, (last) => ({ ...last, citations: parsed.citations }));
           } else if (parsed.type === "ad") {
-            patchLast(k, (last) => ({
-              ...last,
-              ads: [...(last.ads ?? []), parsed as Ad],
-            }));
+            if (toolDone && bubbleText) {
+              heldAds.push(parsed as Ad); // answer bubble isn't open yet
+            } else {
+              patchLast(k, (last) => ({
+                ...last,
+                ads: [...(last.ads ?? []), parsed as Ad],
+              }));
+            }
           } else if (parsed.type === "error") {
             throw new Error("server reported a stream error");
           }
-          // "tool" and "ping" events just feed the watchdog
+          // "ping" events just feed the watchdog
         }
+      }
+      if (heldAds.length) {
+        // stream ended with no token after the tool: attach to the last bubble
+        const ads = heldAds;
+        heldAds = [];
+        patchLast(k, (last) => ({ ...last, ads: [...(last.ads ?? []), ...ads] }));
       }
     } catch (err) {
       console.error("chat stream failed:", err); // details for debugging only
@@ -455,10 +500,14 @@ export default function Chat() {
 
   function retry(text: string) {
     const k = chatKey(chatId);
-    // Drop the failed user+assistant pair, then resend the same message.
-    updateThread(k, (msgs) =>
-      msgs.length && msgs[msgs.length - 1].error ? msgs.slice(0, -2) : msgs
-    );
+    // Drop the whole failed turn — every trailing assistant bubble (a tool
+    // split can leave several) plus its user message — then resend.
+    updateThread(k, (msgs) => {
+      if (!msgs.length || !msgs[msgs.length - 1].error) return msgs;
+      let i = msgs.length;
+      while (i > 0 && msgs[i - 1].role === "assistant") i--;
+      return msgs.slice(0, Math.max(i - 1, 0));
+    });
     send(text);
   }
 
@@ -563,9 +612,13 @@ export default function Chat() {
         <div ref={bottom} />
       </div>
       <div className="chiprow">
-        <button type="button" className="addcarchip" onClick={() => setPicker(true)}>
-          + Add your car
-        </button>
+        {garageFull ? (
+          <span className="empty">Garage is full — max 10 cars.</span>
+        ) : (
+          <button type="button" className="addcarchip" onClick={() => setPicker(true)}>
+            + Add your car
+          </button>
+        )}
       </div>
       <form
         onSubmit={(e) => {

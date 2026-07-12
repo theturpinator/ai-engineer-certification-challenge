@@ -34,12 +34,12 @@ type Car = {
   wishlist?: string[];
   stats?: Stats | null;
   bars?: Bars | null;
+  photo_uploaded?: boolean; // the owner's own photo is stored -> no upload pill
 };
 type Profile = { cars?: Car[]; goals?: string[] };
 type Garage = {
   profile?: Profile;
   instructions?: string[];
-  summaries?: { summary: string; date: string }[];
 };
 
 const EMPTY = "Nothing here yet — just mention it in chat.";
@@ -87,7 +87,7 @@ function ListSection({ title, items }: { title: string; items?: string[] }) {
 
 const RETRY_MS = [8000, 20000, 40000]; // portrait generation takes ~30-60s
 
-function Portrait({ url }: { url: string }) {
+function Portrait({ url, children }: { url: string; children?: React.ReactNode }) {
   const [attempt, setAttempt] = useState(0);
   const [state, setState] = useState<"loading" | "ok" | "pending">("loading");
 
@@ -124,6 +124,7 @@ function Portrait({ url }: { url: string }) {
             }, delay);
         }}
       />
+      {children}
     </div>
   );
 }
@@ -139,9 +140,12 @@ function UploadPhoto({
 }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  // Always-visible pill overlaid on the portrait (no hover-reveal — mobile
+  // has no hover); the parent hides it entirely once a photo is uploaded.
   return (
-    <p className="uploadrow">
-      <label className="uploadbtn">
+    <div className="uploadoverlay">
+      {err && <span className="formerr">{err}</span>}
+      <label className="uploadpill">
         {busy ? "Uploading…" : "Use my own photo"}
         <input
           type="file"
@@ -170,8 +174,7 @@ function UploadPhoto({
           }}
         />
       </label>
-      {err && <span className="formerr">{err}</span>}
-    </p>
+    </div>
   );
 }
 
@@ -210,7 +213,7 @@ function StatBars({ stats, bars }: { stats: Stats; bars?: Bars | null }) {
       );
     });
     return (
-      <div key={title}>
+      <div key={title} className="statgroup">
         <p className="statshead">{title}</p>
         <div className="stats">{rows}</div>
       </div>
@@ -442,11 +445,13 @@ function EditCar({
   car,
   uid,
   onSaved,
+  onDeleted,
   onCancel,
 }: {
   car: Car;
   uid: string;
   onSaved: (car: Car) => void;
+  onDeleted: () => void;
   onCancel: () => void;
 }) {
   const [draft, setDraft] = useState({
@@ -491,6 +496,22 @@ function EditCar({
     }
   }
 
+  async function del() {
+    if (!confirm("Delete this car? Its photo and stats go with it.")) return;
+    setSaving(true);
+    setErr("");
+    try {
+      const r = await apiFetch(`${API_URL}/garage/${uid}/cars/${car.id}`, {
+        method: "DELETE",
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      onDeleted();
+    } catch {
+      setErr("Couldn’t delete — please try again.");
+      setSaving(false);
+    }
+  }
+
   return (
     <section className="card editform">
       <h2>Edit car</h2>
@@ -526,6 +547,9 @@ function EditCar({
       />
       {err && <p className="formerr">{err}</p>}
       <div className="editactions">
+        <button type="button" className="danger" onClick={del} disabled={saving}>
+          Delete car
+        </button>
         <button type="button" className="secondary" onClick={onCancel} disabled={saving}>
           Cancel
         </button>
@@ -578,24 +602,43 @@ export default function GaragePage() {
     garage !== null &&
     !cars.length &&
     !profile.goals?.length &&
-    !garage.instructions?.length &&
-    !garage.summaries?.length;
+    !garage.instructions?.length;
 
-  function onSaved(updated: Car) {
+  function patchCar(id: string, fn: (c: Car) => Car) {
     setGarage((g) =>
       g
         ? {
             ...g,
             profile: {
               ...g.profile,
-              cars: cars.map((c, i) => (i === activeIdx ? updated : c)),
+              cars: (g.profile?.cars ?? []).map((c) => (c.id === id ? fn(c) : c)),
+            },
+          }
+        : g
+    );
+  }
+
+  function onSaved(updated: Car) {
+    // the PATCH response has no photo_uploaded; keep what we know
+    patchCar(updated.id, (c) => ({ ...updated, photo_uploaded: c.photo_uploaded }));
+    setEditing(false);
+    setTick((t) => (t < 3 ? t : t - 1)); // re-arm the stats refetch
+  }
+
+  function onDeleted(id: string) {
+    setGarage((g) =>
+      g
+        ? {
+            ...g,
+            profile: {
+              ...g.profile,
+              cars: (g.profile?.cars ?? []).filter((c) => c.id !== id),
             },
           }
         : g
     );
     setEditing(false);
-    setImgVer((v) => v + 1); // identity/color edits regenerate the portrait
-    setTick((t) => (t < 3 ? t : t - 1)); // re-arm the stats refetch
+    setActive(0);
   }
 
   return (
@@ -619,6 +662,11 @@ export default function GaragePage() {
                 Your garage is empty for now. It fills itself in as you chat — tell the
                 assistant about your Mustangs, your mods, or your plans, and they’ll show
                 up here automatically. You can fine-tune any detail here afterwards.
+              </p>
+            )}
+            {cars.length >= 10 && (
+              <p className="card empty">
+                Garage is full — max 10 cars. Delete a car to free a slot.
               </p>
             )}
             {cars.length > 1 && (
@@ -662,12 +710,18 @@ export default function GaragePage() {
                   )}
                   <Portrait
                     url={`${API_URL}/garage/${uid}/cars/${car.id}/image?v=${imgVer}`}
-                  />
-                  <UploadPhoto
-                    uid={uid}
-                    carId={car.id}
-                    onUploaded={() => setImgVer((v) => v + 1)}
-                  />
+                  >
+                    {!car.photo_uploaded && (
+                      <UploadPhoto
+                        uid={uid}
+                        carId={car.id}
+                        onUploaded={() => {
+                          setImgVer((v) => v + 1);
+                          patchCar(car.id, (c) => ({ ...c, photo_uploaded: true }));
+                        }}
+                      />
+                    )}
+                  </Portrait>
                   {car.stats ? (
                     <StatBars stats={car.stats} bars={car.bars} />
                   ) : (
@@ -680,6 +734,7 @@ export default function GaragePage() {
                     car={car}
                     uid={uid}
                     onSaved={onSaved}
+                    onDeleted={() => onDeleted(car.id)}
                     onCancel={() => setEditing(false)}
                   />
                 ) : (
@@ -698,20 +753,6 @@ export default function GaragePage() {
             )}
             <ListSection title="Goals" items={profile.goals} />
             <ListSection title="Preferences" items={garage.instructions} />
-            <section className="card">
-              <h2>Recent Conversations</h2>
-              {garage.summaries?.length ? (
-                <ul>
-                  {garage.summaries.map((s, i) => (
-                    <li key={i}>
-                      <strong>{s.date}</strong> — {s.summary}
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p className="empty">No past conversations yet.</p>
-              )}
-            </section>
           </>
         )}
       </div>

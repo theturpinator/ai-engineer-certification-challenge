@@ -51,19 +51,19 @@ header nav a {
   padding: 12px 0 24px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 14px;
 }
 
 .card {
   background: #22252c;
   border-radius: 12px;
-  padding: 10px 14px;
+  padding: 14px 16px;
   margin: 0;
   overflow-wrap: break-word; /* long mod names / URLs wrap instead of clipping */
 }
 
 .card h2 {
-  margin: 0 0 4px;
+  margin: 0 0 8px;
   font-size: 0.95rem;
   color: #d94f30;
 }
@@ -296,7 +296,7 @@ button:disabled {
   color: #e8e6e3;
   border: 1px solid #363b45;
   border-radius: 999px;
-  padding: 6px 14px;
+  padding: 8px 16px;
   font-size: 0.9rem;
   font-weight: 600;
 }
@@ -322,7 +322,7 @@ button:disabled {
   border: 1px solid #363b45;
   color: #9096a1;
   border-radius: 8px;
-  padding: 2px 10px;
+  padding: 6px 12px;
   font-size: 0.8rem;
   font-weight: 600;
 }
@@ -334,29 +334,41 @@ button:disabled {
 }
 
 .portraitbox {
-  margin: 8px 0 10px;
+  position: relative; /* anchors the upload pill overlay (issue #37) */
+  margin: 12px 0 14px;
 }
 
-.uploadrow {
+.uploadoverlay {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
   display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: -4px 0 10px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
 }
 
-.uploadbtn {
+.uploadpill {
   cursor: pointer;
-  background: none;
-  border: 1px solid #363b45;
-  color: #9096a1;
-  border-radius: 8px;
-  padding: 2px 10px;
-  font-size: 0.8rem;
+  display: inline-block;
+  background: rgba(20, 22, 27, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  color: #e8e6e3;
+  border-radius: 999px;
+  padding: 9px 16px;
+  font-size: 0.85rem;
   font-weight: 600;
+  backdrop-filter: blur(2px);
 }
 
-.uploadbtn input {
+.uploadpill input {
   display: none;
+}
+
+.uploadoverlay .formerr {
+  background: rgba(20, 22, 27, 0.85);
+  border-radius: 8px;
+  padding: 4px 10px;
 }
 
 .portrait {
@@ -389,7 +401,14 @@ button:disabled {
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  margin: 10px 0 4px;
+  margin: 10px 0 6px;
+}
+
+/* clear break between the Performance and Ownership groups (issue #38) */
+.statgroup + .statgroup {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid #2b2f38;
 }
 
 .figures {
@@ -534,14 +553,14 @@ button:disabled {
 
 .chipadd button,
 .editactions button {
-  padding: 6px 14px;
+  padding: 9px 16px;
   font-size: 14px;
   border-radius: 8px;
 }
 
 .editactions {
   display: flex;
-  gap: 8px;
+  gap: 10px;
   justify-content: flex-end;
 }
 
@@ -549,6 +568,13 @@ button:disabled {
   background: #22252c;
   border: 1px solid #363b45;
   color: #e8e6e3;
+}
+
+.editactions .danger {
+  margin-right: auto; /* delete sits apart from cancel/save */
+  background: none;
+  border: 1px solid #5c322e;
+  color: #ff7a66;
 }
 
 .formerr {
@@ -817,13 +843,13 @@ header nav {
 .shopactions {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 6px;
+  gap: 10px;
+  margin-top: 10px;
 }
 
 .shopactions button {
-  padding: 4px 12px;
-  font-size: 0.8rem;
+  padding: 9px 16px; /* thumb-sized tap targets (issue #38) */
+  font-size: 0.85rem;
   border-radius: 8px;
 }
 
