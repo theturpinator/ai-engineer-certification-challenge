@@ -123,9 +123,13 @@ Two agent tools write long-term memory to Postgres, keyed by `user_id`
   words ("my 2016 GT", "the Fox-body"); the backend matches it against
   existing cars (id, then fuzzy identity tokens) and creates a new entry
   when identifying info matches nothing. Partial updates merge (lists
-  append-dedupe, scalars overwrite); stored as one jsonb row per user in
-  the `garage` table. After each turn a background task fills in missing
-  car stats and portraits.
+  append-dedupe, scalars overwrite); `remove_mods`/`remove_wishlist` delete
+  list items by normalized whole-phrase match ("the cold air intake"
+  removes "Cold air intake"), so wishlist→installed moves and
+  replaced-X-with-Y swaps land as remove+add in one call, and unmatched
+  removals are reported back to the model instead of silently ignored.
+  Stored as one jsonb row per user in the `garage` table. After each turn
+  a background task fills in missing car stats and portraits.
 - `update_instructions` — procedural memory: standing answer preferences
   ("keep answers short"), appended one row per instruction in the
   `instructions` table.

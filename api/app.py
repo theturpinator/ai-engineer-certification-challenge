@@ -8,7 +8,8 @@ sponsored recommendations over the committed ads_artifact/ catalog via a
 mini BM25+dense RRF index; at most two `ad` events per turn, each carrying
 the creative image, UTM click-through link, Sponsored flag, and stat-delta
 chips for the user's car), plus two memory tools: update_garage (semantic:
-the user's cars, per-car mods/wishlist, user-level goals) and
+the user's cars, per-car mods/wishlist with add, remove, and move
+semantics, user-level goals) and
 update_instructions (procedural: standing answer preferences), both keyed by
 user_id in Postgres and folded into the system prompt each turn. Episodic
 memory: after each turn a background task has Claude Haiku keep a rolling 2-3
@@ -123,8 +124,14 @@ details arrive in later turns. The garage holds multiple cars: pass the \
 `car` argument with the user's own words for which car they mean (e.g. \
 "my 2016 GT", "the Fox-body"). When the user mentions a car of theirs that \
 is NOT yet in their garage profile, record it as a new garage entry by \
-calling update_garage with its facts. Never announce or mention that you \
-recorded anything.
+calling update_garage with its facts. When the user says a mod or wishlist \
+item is gone ("I took the intake off", "sold the supercharger", "drop the \
+exhaust from my wishlist"), call update_garage with remove_mods / \
+remove_wishlist; "I installed the X from my wishlist" is remove_wishlist \
+plus mods in one call, and "replaced X with Y" is remove_mods=[X] plus \
+mods=[Y]. NEVER tell the user a removal happened unless the tool call \
+succeeded — if the tool reports the item wasn't found, say so. Never \
+announce or mention that you recorded anything you were not asked about.
 - Whenever the user states a standing preference about how you should answer \
 (e.g. "keep answers short", "always end with X"), silently call \
 update_instructions with that preference, then follow it.
@@ -498,6 +505,38 @@ def _match_entry(text: str, catalog: list[dict] | None = None) -> dict | None:
     return best
 
 
+def _list_remove(current: list[str], phrases: list[str]) -> tuple[list[str], list[str]]:
+    """(kept, unmatched_phrases): drop items matching any phrase by normalized
+    whole-word containment in either direction, so "the cold air intake"
+    removes "Cold air intake" and vice versa."""
+    def hit(item: str, phrase: str) -> bool:
+        a, b = f" {_norm_words(item)} ", f" {_norm_words(phrase)} "
+        return a in b or b in a
+    kept = [x for x in current if not any(hit(x, p) for p in phrases)]
+    missed = [p for p in phrases if not any(hit(x, p) for x in current)]
+    return kept, missed
+
+
+def _apply_car_updates(target: dict, updates: dict, removals: dict) -> list[str]:
+    """Mutate target: removals first, then the additive merge, so a swap in
+    one call ("replaced X with Y") lands as remove+add. Returns removal
+    phrases that matched nothing (the agent tells the user rather than
+    silently confirming)."""
+    missed: list[str] = []
+    for k, phrases in removals.items():
+        phrases = [p for p in phrases if _norm_words(p)]  # "" would match everything
+        if phrases:
+            target[k], miss = _list_remove(target.get(k, []), phrases)
+            missed += miss
+    for k, v in updates.items():
+        if isinstance(v, list):
+            current = target.get(k, [])
+            target[k] = current + [x for x in v if x not in current]
+        else:
+            target[k] = v
+    return missed
+
+
 def _sum_deltas(items, gen_key: str | None,
                 catalog: list[dict] | None = None) -> dict:
     """Summed per-stat deltas of the recognized entries in a mod/wishlist."""
@@ -763,6 +802,8 @@ async def update_garage(
     nickname: str | None = None,
     mods: list[str] | None = None,
     wishlist: list[str] | None = None,
+    remove_mods: list[str] | None = None,
+    remove_wishlist: list[str] | None = None,
     goals: list[str] | None = None,
 ) -> str:
     """Record facts the user reveals about their own Mustang(s). Call this
@@ -778,7 +819,13 @@ async def update_garage(
     entry. Per-car facts: model year, trim (e.g. GT Premium), generation
     (e.g. S550), color, nickname, installed mods, and wishlist/planned mods.
     goals (track, show, daily driver) apply to the user as a whole. All
-    arguments optional; new values merge into the existing profile."""
+    arguments optional; new values merge into the existing profile.
+    When the user says a mod or wishlist item is GONE ("I took the intake
+    off", "drop the exhaust from my wishlist"), pass remove_mods /
+    remove_wishlist with the user's words for the item. "I installed the X
+    from my wishlist" = remove_wishlist=["X"] plus mods=["X"] in the SAME
+    call; "replaced X with Y" = remove_mods=["X"] plus mods=["Y"]. NEVER
+    confirm a removal without calling this tool."""
     user_id = config["configurable"]["user_id"]
     updates = {
         k: v
@@ -787,21 +834,21 @@ async def update_garage(
                          mods=mods, wishlist=wishlist).items()
         if v is not None
     }
+    removals = {k: v for k, v in dict(mods=remove_mods,
+                                      wishlist=remove_wishlist).items() if v}
+    missed: list[str] = []
     async with await _db() as conn:
         # ponytail: read-merge-write, no row lock; fine for one-user-per-thread chat
         profile = await _load_profile(conn, user_id)
         cars = profile.setdefault("cars", [])
-        if updates or car:
+        if updates or car or removals:
             target = _match_car(cars, car, updates)
             if target is None:
+                if not updates:  # removal-only for a car we don't have
+                    return "No matching car in the garage; nothing removed."
                 target = {"id": uuid.uuid4().hex[:8]}
                 cars.append(target)
-            for k, v in updates.items():
-                if isinstance(v, list):
-                    current = target.get(k, [])
-                    target[k] = current + [x for x in v if x not in current]
-                else:
-                    target[k] = v
+            missed = _apply_car_updates(target, updates, removals)
             _autofill_generation(target)
             if target.get("stats") and target["stats"].get("fp") != _stats_fp(target):
                 target["stats"] = None  # identity changed -> recompute stock baseline
@@ -813,6 +860,10 @@ async def update_garage(
             "ON CONFLICT (user_id) DO UPDATE SET profile = EXCLUDED.profile",
             (user_id, Json(profile)),
         )
+    if missed:
+        return ("Garage profile updated, but these weren't in the garage "
+                f"(nothing removed): {', '.join(missed)}. Tell the user "
+                "instead of confirming the removal.")
     return "Garage profile updated."
 
 

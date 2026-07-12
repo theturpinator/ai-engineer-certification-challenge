@@ -93,3 +93,39 @@ async def test_preference_round_trip():
             )
             answer = "".join(e["text"] for e in events if e["type"] == "token")
             assert "cheers" in answer.lower()[-100:], answer
+
+
+@pytest.mark.asyncio
+async def test_removal_conversation_removes_mod(monkeypatch):
+    """Issue #25: 'I took X off' in chat must end with X gone from the
+    garage endpoint's response — no hallucinated confirmations."""
+    import app as app_module
+
+    async def fake_enrich(uid):  # stats/portraits covered elsewhere
+        return None
+
+    monkeypatch.setattr(app_module, "_enrich_garage", fake_enrich)
+    user_id = str(uuid.uuid4())
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                f"/garage/{user_id}/cars",
+                json={"year": 2016, "trim": "GT", "color": "blue"},
+            )
+            assert resp.status_code == 201, resp.text
+            car_id = resp.json()["id"]
+            await client.patch(
+                f"/garage/{user_id}/cars/{car_id}",
+                json={"mods": ["Cold air intake", "Borla exhaust"]},
+            )
+
+            await collect_events(
+                client, "I took the cold air intake off my GT.", user_id
+            )
+
+            profile = (await client.get(f"/garage/{user_id}")).json()["profile"]
+            (car,) = profile["cars"]
+            mods = [m.lower() for m in car.get("mods", [])]
+            assert not any("intake" in m for m in mods), car
+            assert any("borla" in m for m in mods), car

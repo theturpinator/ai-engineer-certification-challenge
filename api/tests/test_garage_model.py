@@ -124,3 +124,47 @@ def test_stats_fp_tracks_identity_only():
     assert _stats_fp(CAR) == _stats_fp({**CAR, "color": "green"})
     assert _stats_fp(CAR) == _stats_fp({**CAR, "mods": ["supercharger"]})
     assert _stats_fp(CAR) != _stats_fp({**CAR, "year": 1969})
+
+
+def test_list_remove_normalized_both_directions():
+    """Issue #25: "the cold air intake" removes "Cold air intake" and the
+    stored string can be the longer side too."""
+    from app import _list_remove
+    kept, missed = _list_remove(["Cold air intake", "Borla exhaust"],
+                                ["took off the cold air intake"])
+    assert kept == ["Borla exhaust"] and missed == []
+    kept, missed = _list_remove(["Flowmaster cat-back exhaust"], ["exhaust"])
+    assert kept == [] and missed == []
+
+
+def test_list_remove_reports_unmatched_and_ignores_empty():
+    from app import _list_remove
+    kept, missed = _list_remove(["Supercharger"], ["nitrous kit"])
+    assert kept == ["Supercharger"] and missed == ["nitrous kit"]
+    # "" must not match everything
+    from app import _apply_car_updates
+    car = {"mods": ["Supercharger"]}
+    assert _apply_car_updates(car, {}, {"mods": ["", "  "]}) == []
+    assert car["mods"] == ["Supercharger"]
+
+
+def test_apply_updates_move_and_swap():
+    """Wishlist→installed move and replaced-X-with-Y swap in one call."""
+    from app import _apply_car_updates
+    car = {"mods": ["Cold air intake"], "wishlist": ["Supercharger", "Big brake kit"]}
+    missed = _apply_car_updates(
+        car, {"mods": ["Supercharger"]}, {"wishlist": ["supercharger"]})
+    assert missed == []
+    assert car["mods"] == ["Cold air intake", "Supercharger"]
+    assert car["wishlist"] == ["Big brake kit"]
+    missed = _apply_car_updates(
+        car, {"mods": ["Whipple supercharger"]}, {"mods": ["supercharger"]})
+    assert missed == []
+    assert car["mods"] == ["Cold air intake", "Whipple supercharger"]
+
+
+def test_apply_updates_scalar_merge_unchanged():
+    from app import _apply_car_updates
+    car = {"trim": "GT"}
+    assert _apply_car_updates(car, {"color": "red", "mods": ["intake"]}, {}) == []
+    assert car == {"trim": "GT", "color": "red", "mods": ["intake"]}
