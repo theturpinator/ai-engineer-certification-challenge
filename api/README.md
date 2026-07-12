@@ -149,11 +149,12 @@ dedicated endpoint. For a user with no profile at all (no cars, no goals,
 no `onboarded` key), the client sends the exact message
 `"[begin onboarding]"`; the server stamps `profile.onboarded = false` and,
 while the flag is false, injects an interview script into the system
-prompt — the agent asks the profile questions one at a time (their
-Mustang, planned upgrades, future purchase, shows/events, track days),
-records answers with `update_garage`, then calls the `complete_onboarding`
-tool, which sets `profile.onboarded = true` (the client's cue to unlock
-navigation) and thanks the user. The sentinel message is hidden from
+prompt — the agent asks the profile questions one at a time (what to call
+them, their Mustang, planned upgrades, future purchase, shows/events,
+track days, and how they like answers formatted), records answers with
+`update_garage` and `update_instructions`, then calls the
+`complete_onboarding` tool, which sets `profile.onboarded = true` (the
+client's cue to unlock navigation) and thanks the user. The sentinel message is hidden from
 transcript replays and never becomes a chat title. `GET /garage/{user_id}`
 exposes the flag via `profile.onboarded`: `false` = interview in progress,
 `true` = done, absent = pre-onboarding user (grandfathered when their

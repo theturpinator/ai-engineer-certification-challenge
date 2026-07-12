@@ -44,9 +44,10 @@ PATCH/DELETE /garage/{user_id}/cars/{car_id}. First-run onboarding (issue
 #46) runs inside the chat: a brand-new user's client POSTs the sentinel
 message "[begin onboarding]", which stamps profile.onboarded=false and
 injects an interview script into the system prompt — the agent asks the
-profile questions one at a time, records answers via update_garage, and
-finishes by calling the complete_onboarding tool (profile.onboarded=true,
-the client's unlock signal). The sentinel never appears in transcript
+profile questions one at a time (name, their Mustang, goals, and how they
+like answers formatted), records them via update_garage and
+update_instructions, and finishes by calling the complete_onboarding tool
+(profile.onboarded=true, the client's unlock signal). The sentinel never appears in transcript
 replays or chat titles. Users can hold multiple chats:
 POST /chat takes an optional chat_id (thread_id = user_id:chat_id, the legacy
 "default" chat keeps the bare user_id thread), GET /chats/{user_id} lists
@@ -172,23 +173,29 @@ FIRST-RUN ONBOARDING IS IN PROGRESS. This is a brand-new user; before \
 normal Q&A, interview them to build their profile. Greet them warmly and \
 briefly, then ask these questions ONE AT A TIME — exactly one question per \
 message, always waiting for the user's reply before the next:
-1. Do you have a Mustang? If yes, ask what it is (year, trim, color, and a \
+1. What can I call you? (record with update_instructions, e.g. "Address \
+the user as Jake", and use their name from then on)
+2. Do you have a Mustang? If yes, ask what it is (year, trim, color, and a \
 nickname if it has one) and record it with update_garage. Partial answers \
 are fine — ask once for anything missing, then move on.
-2. Are you planning any upgrades or mods? (yes → update_garage goal \
+3. Are you planning any upgrades or mods? (yes → update_garage goal \
 "Planning upgrades")
-3. Do you think you'll buy another Mustang some day? (yes → goal \
+4. Do you think you'll buy another Mustang some day? (yes → goal \
 "Shopping for a future Mustang")
-4. Want to keep up with car shows and events? (yes → goal "Interested in \
+5. Want to keep up with car shows and events? (yes → goal "Interested in \
 car shows and events")
-5. Are you into track days — or want to be? (yes → goal "Track days")
-Record every answer silently with update_garage the moment it arrives — \
-each yes above earns its goal BEFORE you reply, including the final \
-question's. If one reply answers several questions, record them all and \
-skip ahead. If the user wants to skip onboarding or clearly won't play \
-along, stop asking. After the final answer is recorded (or on skip), call \
-complete_onboarding, then send a short thank-you: their profile is saved \
-and they can now ask anything Mustang. Do not answer unrelated questions until onboarding is complete — \
+6. Are you into track days — or want to be? (yes → goal "Track days")
+7. Last one: how do you like your answers — short and to the point or \
+detailed, bullet lists or prose? (record with update_instructions, e.g. \
+"Keep answers short, in bullet lists")
+Record every answer silently the moment it arrives — car facts and goals \
+via update_garage, name and answer style via update_instructions, each \
+BEFORE you reply, including the final question's. If one reply answers \
+several questions, record them all and skip ahead. If the user wants to \
+skip onboarding or clearly won't play along, stop asking. After the final \
+answer is recorded (or on skip), call complete_onboarding, then send a \
+short thank-you: their profile is saved and they can now ask anything \
+Mustang. Do not answer unrelated questions until onboarding is complete — \
 give a one-line answer at most, then return to the current question. The \
 user's message "[begin onboarding]" is an automatic trigger, not something \
 they typed — never mention or quote it."""
