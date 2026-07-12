@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { apiFetch, AuthButton } from "../auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -230,7 +231,7 @@ function EditCar({
     setErr("");
     const year = parseInt(draft.year, 10);
     try {
-      const r = await fetch(`${API_URL}/garage/${uid}/cars/${car.id}`, {
+      const r = await apiFetch(`${API_URL}/garage/${uid}/cars/${car.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -320,7 +321,7 @@ export default function GaragePage() {
 
   useEffect(() => {
     if (!uid) return;
-    fetch(`${API_URL}/garage/${uid}`)
+    apiFetch(`${API_URL}/garage/${uid}`)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((g: Garage) => {
         setGarage(g);
@@ -364,6 +365,7 @@ export default function GaragePage() {
       <header>
         My Garage
         <nav>
+          <AuthButton />
           <Link href="/">Chat</Link>
         </nav>
       </header>

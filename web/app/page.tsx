@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import ReactMarkdown from "react-markdown";
+import { apiFetch, AuthButton } from "./auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -58,7 +59,7 @@ function AddCarModal({
     setSaving(true);
     setErr("");
     try {
-      const r = await fetch(`${API_URL}/garage/${uid}/cars`, {
+      const r = await apiFetch(`${API_URL}/garage/${uid}/cars`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -204,7 +205,7 @@ export default function Chat() {
     setChatId(localStorage.getItem("md_chat_id") || "default");
     // Empty garage -> suggest the picker (once; dismissal sticks).
     if (localStorage.getItem("md_addcar_prompt") !== "dismissed") {
-      fetch(`${API_URL}/garage/${id}`)
+      apiFetch(`${API_URL}/garage/${id}`)
         .then((r) => (r.ok ? r.json() : null))
         .then((g) => {
           if (g && !g.profile?.cars?.length) setCarPrompt(true);
@@ -216,7 +217,7 @@ export default function Chat() {
   // The server transcript is the source of truth when (re)opening a chat.
   useEffect(() => {
     if (!chatId || !userId.current) return;
-    fetch(`${API_URL}/chats/${userId.current}/${chatId}/messages`)
+    apiFetch(`${API_URL}/chats/${userId.current}/${chatId}/messages`)
       .then((r) => (r.ok ? r.json() : []))
       .then(setMessages)
       .catch(() => {});
@@ -228,7 +229,7 @@ export default function Chat() {
 
   function openDrawer() {
     setDrawer(true);
-    fetch(`${API_URL}/chats/${userId.current}`)
+    apiFetch(`${API_URL}/chats/${userId.current}`)
       .then((r) => (r.ok ? r.json() : []))
       .then(setChats)
       .catch(() => {});
@@ -275,7 +276,7 @@ export default function Chat() {
     setMessages((m) => [...m, { role: "user", content: text }, { role: "assistant", content: "" }]);
 
     try {
-      const res = await fetch(`${API_URL}/chat`, {
+      const res = await apiFetch(`${API_URL}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -361,6 +362,7 @@ export default function Chat() {
         </button>
         Ask MustangDriver
         <nav>
+          <AuthButton />
           <Link href="/garage">My Garage</Link>
         </nav>
       </header>

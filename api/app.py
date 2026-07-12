@@ -22,7 +22,11 @@ PATCH/DELETE /garage/{user_id}/cars/{car_id}. Users can hold multiple chats:
 POST /chat takes an optional chat_id (thread_id = user_id:chat_id, the legacy
 "default" chat keeps the bare user_id thread), GET /chats/{user_id} lists
 them, GET /chats/{user_id}/{chat_id}/messages replays a transcript from the
-Postgres checkpointer (docker compose, repo root).
+Postgres checkpointer (docker compose, repo root). Login is optional: POST
+/auth/google exchanges a Google ID token for an app JWT bound to a canonical
+user_id (identities table, google_sub -> user_id; first login adopts the
+browser's anonymous id), and a valid Authorization bearer overrides the
+path/body user id on every user-scoped route.
 
 Run locally:  uv run uvicorn app:app --port 8000
 """
@@ -34,14 +38,18 @@ import os
 import re
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
 
 import httpx
+import jwt
 import numpy as np
 import psycopg
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token as google_id_token
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
@@ -739,6 +747,12 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE car_images ADD COLUMN IF NOT EXISTS build_fp TEXT"
             )
             await conn.execute(
+                "CREATE TABLE IF NOT EXISTS identities ("
+                "google_sub TEXT PRIMARY KEY, user_id TEXT NOT NULL, "
+                "email TEXT, name TEXT, picture TEXT, "
+                "created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+            )
+            await conn.execute(
                 "CREATE TABLE IF NOT EXISTS chats ("
                 "user_id TEXT NOT NULL, chat_id TEXT NOT NULL, "
                 "title TEXT NOT NULL, "
@@ -760,8 +774,95 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-# ponytail: open CORS, no auth on this API anyway; restrict to the web origin if that changes
+# ponytail: open CORS; identity comes from the bearer token, not the origin
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+# --- Optional Google login (issue #17): identity resolution, not data migration.
+# identities maps google_sub -> canonical internal user_id; everything else in
+# the system stays keyed by user_id. First-ever login adopts the browser's
+# anonymous UUID in place; later logins (any device) return the canonical id.
+
+
+def _verify_google_token(id_token: str) -> dict:
+    """Verify a Google ID token against Google's JWKS; returns its claims.
+    The seam tests monkeypatch — everything past here runs for real."""
+    return google_id_token.verify_oauth2_token(
+        id_token, google_requests.Request(), os.environ["GOOGLE_CLIENT_ID"]
+    )
+
+
+class GoogleLogin(BaseModel):
+    id_token: str
+    anon_user_id: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)
+    ]
+
+
+@app.post("/auth/google")
+async def auth_google(body: GoogleLogin):
+    """Exchange a Google ID token for an app JWT + the canonical user_id.
+    Unknown google_sub: bind it to the caller's anonymous user_id (their
+    existing garage/chats are adopted in place, zero data movement)."""
+    if not os.environ.get("GOOGLE_CLIENT_ID") or not os.environ.get("AUTH_JWT_SECRET"):
+        raise HTTPException(503, "Google sign-in is not configured")
+    try:
+        claims = _verify_google_token(body.id_token)
+    except Exception:  # bad signature, expired, wrong audience/issuer
+        raise HTTPException(401, "invalid Google token")
+    async with await _db() as conn:
+        row = await (
+            await conn.execute(
+                # existing sub keeps its user_id (canonical); profile fields refresh
+                "INSERT INTO identities (google_sub, user_id, email, name, picture) "
+                "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (google_sub) DO UPDATE SET "
+                "email = EXCLUDED.email, name = EXCLUDED.name, "
+                "picture = EXCLUDED.picture RETURNING user_id",
+                (claims["sub"], body.anon_user_id, claims.get("email"),
+                 claims.get("name"), claims.get("picture")),
+            )
+        ).fetchone()
+    user_id = row[0]
+    token = jwt.encode(
+        {"sub": claims["sub"], "uid": user_id,
+         "exp": datetime.now(timezone.utc) + timedelta(days=30)},
+        os.environ["AUTH_JWT_SECRET"], algorithm="HS256",
+    )
+    return {"token": token, "user_id": user_id, "name": claims.get("name"),
+            "email": claims.get("email"), "picture": claims.get("picture")}
+
+
+async def _auth_uid(authorization: Annotated[str | None, Header()] = None) -> str | None:
+    """The canonical user_id from a valid app-JWT bearer; None when anonymous.
+    Invalid/expired tokens 401 explicitly so the client clears its token and
+    retries anonymously, rather than silently acting as the wrong user."""
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return None
+    try:
+        return jwt.decode(authorization[7:], os.environ.get("AUTH_JWT_SECRET", ""),
+                          algorithms=["HS256"])["uid"]
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "invalid or expired token")
+
+
+AuthUid = Annotated[str | None, Depends(_auth_uid)]
+
+
+@app.get("/auth/me")
+async def auth_me(auth_uid: AuthUid = None):
+    """Restore session state from a stored app JWT."""
+    if not auth_uid:
+        raise HTTPException(401, "not signed in")
+    async with await _db() as conn:
+        row = await (
+            await conn.execute(
+                "SELECT name, email, picture FROM identities WHERE user_id = %s LIMIT 1",
+                (auth_uid,),
+            )
+        ).fetchone()
+    if not row:
+        raise HTTPException(401, "unknown identity")
+    return {"user_id": auth_uid, "name": row[0], "email": row[1], "picture": row[2]}
 
 
 class ChatRequest(BaseModel):
@@ -792,7 +893,8 @@ async def health():
 
 
 @app.get("/garage/{user_id}")
-async def garage(user_id: str):
+async def garage(user_id: str, auth_uid: AuthUid = None):
+    user_id = auth_uid or user_id  # signed-in identity wins over the path id
     profile, instructions, summaries = await _get_memory(user_id)
     if profile.get("cars"):
         # opportunistic fire-and-forget: fills stats/portraits missed earlier;
@@ -806,7 +908,8 @@ async def garage(user_id: str):
 
 
 @app.get("/garage/{user_id}/cars/{car_id}/image")
-async def car_image(user_id: str, car_id: str):
+async def car_image(user_id: str, car_id: str, auth_uid: AuthUid = None):
+    user_id = auth_uid or user_id
     async with await _db() as conn:
         row = await (
             await conn.execute(
@@ -852,9 +955,11 @@ class CarCreate(BaseModel):
 
 
 @app.post("/garage/{user_id}/cars", status_code=201)
-async def create_car(user_id: str, body: CarCreate, background_tasks: BackgroundTasks):
+async def create_car(user_id: str, body: CarCreate, background_tasks: BackgroundTasks,
+                     auth_uid: AuthUid = None):
     """Create a car from the picker; generation derives from the year and
     enrichment (stats + portrait) runs in the background, like PATCH."""
+    user_id = auth_uid or user_id
     car = {"id": uuid.uuid4().hex[:8], **body.model_dump(exclude_none=True)}
     _autofill_generation(car)
     async with await _db() as conn:
@@ -877,7 +982,8 @@ async def create_car(user_id: str, body: CarCreate, background_tasks: Background
 
 @app.patch("/garage/{user_id}/cars/{car_id}")
 async def patch_car(user_id: str, car_id: str, patch: CarPatch,
-                    background_tasks: BackgroundTasks):
+                    background_tasks: BackgroundTasks, auth_uid: AuthUid = None):
+    user_id = auth_uid or user_id
     updates = patch.model_dump(exclude_unset=True)
     async with await _db() as conn:
         profile = await _load_profile(conn, user_id)
@@ -901,7 +1007,8 @@ async def patch_car(user_id: str, car_id: str, patch: CarPatch,
 
 
 @app.delete("/garage/{user_id}/cars/{car_id}", status_code=204)
-async def delete_car(user_id: str, car_id: str):
+async def delete_car(user_id: str, car_id: str, auth_uid: AuthUid = None):
+    user_id = auth_uid or user_id
     async with await _db() as conn:
         profile = await _load_profile(conn, user_id)
         cars = profile.get("cars", [])
@@ -919,9 +1026,10 @@ async def delete_car(user_id: str, car_id: str):
 
 
 @app.get("/chats/{user_id}")
-async def list_chats(user_id: str):
+async def list_chats(user_id: str, auth_uid: AuthUid = None):
     """The user's chats, recent-first. A legacy bare-user_id thread that has
     checkpointer state but no chats row yet gets its row backfilled here."""
+    user_id = auth_uid or user_id
     async with await _db() as conn:
         rows = await (
             await conn.execute(
@@ -954,9 +1062,10 @@ async def list_chats(user_id: str):
 
 
 @app.get("/chats/{user_id}/{chat_id}/messages")
-async def chat_messages(user_id: str, chat_id: str):
+async def chat_messages(user_id: str, chat_id: str, auth_uid: AuthUid = None):
     """The chat's transcript, reconstructed from the checkpointer: user and
     assistant turns only (tool calls/results and empty AI messages skipped)."""
+    user_id = auth_uid or user_id
     snap = await _agent.aget_state(
         {"configurable": {"thread_id": _thread_id(user_id, chat_id)}}
     )
@@ -980,13 +1089,14 @@ async def _post_turn(user_id: str, session_id: str, user_text: str, parts: list[
 
 
 @app.post("/chat")
-async def chat(req: ChatRequest):
-    profile, instructions, summaries = await _get_memory(req.user_id)
+async def chat(req: ChatRequest, auth_uid: AuthUid = None):
+    user_id = auth_uid or req.user_id  # signed-in identity wins over the body id
+    profile, instructions, summaries = await _get_memory(user_id)
     async with await _db() as conn:  # title = first user message, then just bump
         await conn.execute(
             "INSERT INTO chats (user_id, chat_id, title) VALUES (%s, %s, %s) "
             "ON CONFLICT (user_id, chat_id) DO UPDATE SET updated_at = now()",
-            (req.user_id, req.chat_id, req.message[:60]),
+            (user_id, req.chat_id, req.message[:60]),
         )
     system = SYSTEM_PROMPT
     if profile:
@@ -1011,8 +1121,8 @@ async def chat(req: ChatRequest):
         stream = _agent.astream(
             {"messages": [{"role": "user", "content": req.message}]},
             {"configurable": {
-                "thread_id": _thread_id(req.user_id, req.chat_id),
-                "user_id": req.user_id,
+                "thread_id": _thread_id(user_id, req.chat_id),
+                "user_id": user_id,
                 "system_prompt": system,
             }},
             stream_mode="messages",
@@ -1035,6 +1145,6 @@ async def chat(req: ChatRequest):
         sse(),
         media_type="text/event-stream",
         background=BackgroundTask(
-            _post_turn, req.user_id, req.session_id, req.message, answer_parts
+            _post_turn, user_id, req.session_id, req.message, answer_parts
         ),
     )

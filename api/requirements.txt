@@ -9,5 +9,7 @@ langchain-openai
 qdrant-client
 psycopg[binary]
 httpx
+google-auth
+PyJWT
 pytest
 pytest-asyncio

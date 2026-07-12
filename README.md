@@ -252,6 +252,18 @@ npm run dev
 
 Local `DATABASE_URL` is `postgresql://postgres:postgres@localhost:5433/mustang`; production uses the Neon pooled connection string. API tests: `cd api && uv run pytest`. Eval harness setup and runs: [`evals/README.md`](evals/README.md).
 
+### Optional Google sign-in
+
+Login is optional: anonymous browser-UUID users keep working with no login. Signing in with Google binds the browser's current anonymous `user_id` to the Google account (identities table, `google_sub → user_id`), so the same garage/cars/chats follow the user across devices. Known limit: anonymous data accumulated on a *second* device before logging in there is orphaned when that device switches to the canonical id (no merge).
+
+Config (feature is hidden until set):
+
+- `GOOGLE_CLIENT_ID` (API, `.env`) — the Google OAuth Client ID; verify audience for ID tokens
+- `NEXT_PUBLIC_GOOGLE_CLIENT_ID` (web, same value) — renders the Sign in button
+- `AUTH_JWT_SECRET` (API, `.env`) — signs the app session JWT; any long random string (`openssl rand -hex 32`)
+
+Owner action: in Google Cloud Console create an **OAuth Client ID (Web application)** with authorized JavaScript origins `http://localhost:3000` and `https://ask-mustangdriver-web.vercel.app`, then set the three variables above (locally and in the Vercel projects).
+
 ## Repo layout
 
 ```
