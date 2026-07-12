@@ -326,7 +326,12 @@ export default function Chat() {
     if (streamingRef.current[k]) return;
     apiFetch(`${API_URL}/chats/${userId.current}/${chatId}/messages`)
       .then((r) => (r.ok ? r.json() : []))
-      .then((msgs) => setThreads((t) => ({ ...t, [k]: msgs })))
+      .then((msgs) => {
+        // a stream may have started while this was in flight; its buffer
+        // is fresher than the server transcript — don't wipe it
+        if (streamingRef.current[k]) return;
+        setThreads((t) => ({ ...t, [k]: msgs }));
+      })
       .catch(() => {});
   }, [chatId]);
 
@@ -421,9 +426,10 @@ export default function Chat() {
       // an empty bubble behind. SSE contract unchanged.
       let bubbleText = ""; // what has streamed into the current bubble
       let toolDone = false; // a tool finished since the last token
-      // Ads arrive right after the tool event — before the token that opens
-      // the answer bubble. Hold them so they attach to the answer, never the
-      // preamble (issue #39: "ads render under the answer bubble").
+      // Ads arrive mid-stream, right after their tool event. Hold every one
+      // until the stream completes, then attach to the trailing (answer)
+      // bubble — below the finished text — so cards never interleave with
+      // tokens still streaming in (issues #39, #41).
       let heldAds: Ad[] = [];
       for (;;) {
         const { done, value } = await readWithTimeout(reader, WATCHDOG_MS);
@@ -447,13 +453,10 @@ export default function Chat() {
             }
             toolDone = false;
             bubbleText += parsed.text;
-            const ads = heldAds;
-            heldAds = [];
             patchLast(k, (last) => ({
               ...last,
               status: undefined,
               content: last.content + parsed.text,
-              ads: ads.length ? [...(last.ads ?? []), ...ads] : last.ads,
             }));
           } else if (parsed.type === "tool") {
             toolDone = true; // the next token opens the answer bubble
@@ -465,14 +468,7 @@ export default function Chat() {
           } else if (parsed.type === "citations" && parsed.citations.length > 0) {
             patchLast(k, (last) => ({ ...last, citations: parsed.citations }));
           } else if (parsed.type === "ad") {
-            if (toolDone && bubbleText) {
-              heldAds.push(parsed as Ad); // answer bubble isn't open yet
-            } else {
-              patchLast(k, (last) => ({
-                ...last,
-                ads: [...(last.ads ?? []), parsed as Ad],
-              }));
-            }
+            heldAds.push(parsed as Ad); // attached after the stream completes
           } else if (parsed.type === "error") {
             throw new Error("server reported a stream error");
           }
@@ -480,7 +476,7 @@ export default function Chat() {
         }
       }
       if (heldAds.length) {
-        // stream ended with no token after the tool: attach to the last bubble
+        // stream done: cards land at the end of the answer bubble in one go
         const ads = heldAds;
         heldAds = [];
         patchLast(k, (last) => ({ ...last, ads: [...(last.ads ?? []), ...ads] }));
