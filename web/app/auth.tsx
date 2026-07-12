@@ -36,6 +36,18 @@ function getAuth(): Auth | null {
   }
 }
 
+/** First-run onboarding gate (issue #46), from a GET /garage response:
+ * `onboarded === false` is an interview in progress; a missing flag with an
+ * empty profile is a brand-new user who hasn't been kicked off yet. Anyone
+ * the app already knows (cars/goals, or the completed flag) passes. */
+export function needsOnboarding(g: {
+  profile?: { onboarded?: boolean; cars?: unknown[]; goals?: unknown[] };
+} | null): boolean {
+  const p = g?.profile ?? {};
+  if (p.onboarded !== undefined) return p.onboarded === false;
+  return !p.cars?.length && !p.goals?.length;
+}
+
 /** fetch that attaches the app JWT when signed in. On a 401 the token is
  * dead (expired/revoked): clear it and retry once anonymously, so a stale
  * login never blocks the app. A 30s default timeout keeps a stalled request

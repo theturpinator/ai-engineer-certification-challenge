@@ -40,7 +40,14 @@ sponsor products + the full searchable catalog with per-car delta chips);
 its have-it/want-it actions write through the existing car PATCH. GET
 /garage/{user_id} returns everything known (each car carries composed bars
 plus photo_uploaded, which drives the upload-pill UI); cars are editable via
-PATCH/DELETE /garage/{user_id}/cars/{car_id}. Users can hold multiple chats:
+PATCH/DELETE /garage/{user_id}/cars/{car_id}. First-run onboarding (issue
+#46) runs inside the chat: a brand-new user's client POSTs the sentinel
+message "[begin onboarding]", which stamps profile.onboarded=false and
+injects an interview script into the system prompt — the agent asks the
+profile questions one at a time, records answers via update_garage, and
+finishes by calling the complete_onboarding tool (profile.onboarded=true,
+the client's unlock signal). The sentinel never appears in transcript
+replays or chat titles. Users can hold multiple chats:
 POST /chat takes an optional chat_id (thread_id = user_id:chat_id, the legacy
 "default" chat keeps the bare user_id thread), GET /chats/{user_id} lists
 them, GET /chats/{user_id}/{chat_id}/messages replays a transcript from the
@@ -154,6 +161,37 @@ announce or mention that you recorded anything you were not asked about.
 (e.g. "keep answers short", "always end with X"), silently call \
 update_instructions with that preference, then follow it.
 - Always follow every standing instruction listed below, in every answer."""
+
+# First-run onboarding (issue #46): the client opens a brand-new user's chat
+# with this exact hidden message; it never shows in transcripts or titles.
+ONBOARD_KICKOFF = "[begin onboarding]"
+
+ONBOARDING_PROMPT = """
+
+FIRST-RUN ONBOARDING IS IN PROGRESS. This is a brand-new user; before \
+normal Q&A, interview them to build their profile. Greet them warmly and \
+briefly, then ask these questions ONE AT A TIME — exactly one question per \
+message, always waiting for the user's reply before the next:
+1. Do you have a Mustang? If yes, ask what it is (year, trim, color, and a \
+nickname if it has one) and record it with update_garage. Partial answers \
+are fine — ask once for anything missing, then move on.
+2. Are you planning any upgrades or mods? (yes → update_garage goal \
+"Planning upgrades")
+3. Do you think you'll buy another Mustang some day? (yes → goal \
+"Shopping for a future Mustang")
+4. Want to keep up with car shows and events? (yes → goal "Interested in \
+car shows and events")
+5. Are you into track days — or want to be? (yes → goal "Track days")
+Record every answer silently with update_garage the moment it arrives — \
+each yes above earns its goal BEFORE you reply, including the final \
+question's. If one reply answers several questions, record them all and \
+skip ahead. If the user wants to skip onboarding or clearly won't play \
+along, stop asking. After the final answer is recorded (or on skip), call \
+complete_onboarding, then send a short thank-you: their profile is saved \
+and they can now ask anything Mustang. Do not answer unrelated questions until onboarding is complete — \
+give a one-line answer at most, then return to the current question. The \
+user's message "[begin onboarding]" is an automatic trigger, not something \
+they typed — never mention or quote it."""
 
 _embeddings = OpenAIEmbeddings(
     model="openai/text-embedding-3-small",
@@ -895,9 +933,15 @@ async def update_garage(
         if goals:
             current = profile.get("goals", [])
             profile["goals"] = current + [g for g in goals if g not in current]
+        # keep the row's onboarded flag, not this read's possibly-stale copy:
+        # the agent may run complete_onboarding in parallel with this call,
+        # and writing stale false back would re-lock a just-unlocked user
         await conn.execute(
             "INSERT INTO garage (user_id, profile) VALUES (%s, %s) "
-            "ON CONFLICT (user_id) DO UPDATE SET profile = EXCLUDED.profile",
+            "ON CONFLICT (user_id) DO UPDATE SET profile = "
+            "CASE WHEN garage.profile ? 'onboarded' THEN EXCLUDED.profile "
+            "|| jsonb_build_object('onboarded', garage.profile->'onboarded') "
+            "ELSE EXCLUDED.profile END",
             (user_id, Json(profile)),
         )
     if full:
@@ -909,6 +953,26 @@ async def update_garage(
                 f"(nothing removed): {', '.join(missed)}. Tell the user "
                 "instead of confirming the removal.")
     return "Garage profile updated."
+
+
+@tool
+async def complete_onboarding(config: RunnableConfig) -> str:
+    """Mark first-run onboarding finished. Call exactly once, right after the
+    user answers the final onboarding question (or declines onboarding) —
+    never at any other time."""
+    user_id = config["configurable"]["user_id"]
+    async with await _db() as conn:
+        # surgical jsonb merge, no read: the agent often calls this in the
+        # same turn as the final update_garage, and a read-merge-write here
+        # would clobber that parallel write (lost the last goal in testing)
+        await conn.execute(
+            "INSERT INTO garage (user_id, profile) "
+            "VALUES (%s, '{\"onboarded\": true}') "
+            "ON CONFLICT (user_id) DO UPDATE "
+            "SET profile = garage.profile || '{\"onboarded\": true}'",
+            (user_id,),
+        )
+    return "Onboarding recorded. Thank the user and let them know their profile is saved."
 
 
 @tool
@@ -995,7 +1059,7 @@ async def lifespan(app: FastAPI):
                 api_key=os.environ["AI_GATEWAY_API_KEY"],
             ),
             [search_archive, web_search, check_recalls, recommend_products,
-             update_garage, update_instructions],
+             update_garage, update_instructions, complete_onboarding],
             prompt=_prompt,
             checkpointer=saver,
         )
@@ -1396,7 +1460,9 @@ async def list_chats(user_id: str, auth_uid: AuthUid = None):
         msgs = (snap.values or {}).get("messages") if snap else None
         if msgs:
             title = next((_msg_text(m)[:60] for m in msgs
-                          if m.type == "human" and _msg_text(m)), "Earlier conversation")
+                          if m.type == "human" and _msg_text(m)
+                          and _msg_text(m) != ONBOARD_KICKOFF),
+                         "Earlier conversation")
             async with await _db() as conn:
                 row = await (
                     await conn.execute(
@@ -1423,7 +1489,7 @@ async def chat_messages(user_id: str, chat_id: str, auth_uid: AuthUid = None):
     out = []
     for m in ((snap.values or {}).get("messages", []) if snap else []):
         text = _msg_text(m)
-        if not text:
+        if not text or text == ONBOARD_KICKOFF:  # the hidden onboarding trigger
             continue
         if m.type == "human":
             out.append({"role": "user", "content": text})
@@ -1443,13 +1509,29 @@ async def _post_turn(user_id: str, session_id: str, user_text: str, parts: list[
 async def chat(req: ChatRequest, auth_uid: AuthUid = None):
     user_id = auth_uid or req.user_id  # signed-in identity wins over the body id
     profile, instructions, summaries = await _get_memory(user_id)
+    # First-run onboarding (issue #46): the kickoff sentinel from a user we
+    # know nothing about stamps onboarded=false; the flag staying false keeps
+    # the interview script in the prompt across turns (even once the garage
+    # fills up mid-interview) until complete_onboarding flips it true.
+    if (req.message == ONBOARD_KICKOFF and "onboarded" not in profile
+            and not profile.get("cars") and not profile.get("goals")):
+        profile["onboarded"] = False
+        async with await _db() as conn:
+            await conn.execute(
+                "INSERT INTO garage (user_id, profile) VALUES (%s, %s) "
+                "ON CONFLICT (user_id) DO UPDATE SET profile = EXCLUDED.profile",
+                (user_id, Json(profile)),
+            )
     async with await _db() as conn:  # title = first user message, then just bump
         await conn.execute(
             "INSERT INTO chats (user_id, chat_id, title) VALUES (%s, %s, %s) "
             "ON CONFLICT (user_id, chat_id) DO UPDATE SET updated_at = now()",
-            (user_id, req.chat_id, req.message[:60]),
+            (user_id, req.chat_id,
+             "Welcome" if req.message == ONBOARD_KICKOFF else req.message[:60]),
         )
     system = SYSTEM_PROMPT
+    if profile.get("onboarded") is False:
+        system += ONBOARDING_PROMPT
     if profile:
         lean = {**profile, "cars": [  # stats are UI data, not prompt data
             {k: v for k, v in c.items() if k != "stats"} for c in profile.get("cars", [])

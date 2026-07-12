@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { apiFetch, AuthButton } from "../auth";
+import { apiFetch, AuthButton, needsOnboarding } from "../auth";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -72,7 +72,14 @@ export default function ProfilePage() {
     }
     apiFetch(`${API_URL}/garage/${id}`)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-      .then(setGarage)
+      .then((g: Garage) => {
+        if (needsOnboarding(g)) {
+          // onboarding isn't finished — the chat interview comes first (#46)
+          window.location.replace("/");
+          return;
+        }
+        setGarage(g);
+      })
       .catch(() => setError(true));
   }, []);
 

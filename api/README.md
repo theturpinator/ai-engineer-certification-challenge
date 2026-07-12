@@ -28,7 +28,7 @@ uv run uvicorn app:app --port 8000
   1. `data: {"type": "tool_start", "name": ...}` — emitted the moment the
      model decides to call a tool (before it runs), so clients can show
      status ("Searching the archive…") instead of bare dots
-  2. `data: {"type": "tool", "name": "search_archive" | "web_search" | "check_recalls" | "recommend_products" | "update_garage" | "update_instructions"}` —
+  2. `data: {"type": "tool", "name": "search_archive" | "web_search" | "check_recalls" | "recommend_products" | "update_garage" | "update_instructions" | "complete_onboarding"}` —
      one event per tool call the agent makes, when its result arrives (may
      be interleaved with tokens; zero or more)
   3. `data: {"type": "token", "text": "..."}` — one event per token as the model generates
@@ -143,6 +143,21 @@ uv run uvicorn app:app --port 8000
 
 - `DELETE /garage/{user_id}/cars/{car_id}` → 204; removes the car and its
   cached portrait.
+
+**First-run onboarding (issue #46)** happens inside `POST /chat`, not on a
+dedicated endpoint. For a user with no profile at all (no cars, no goals,
+no `onboarded` key), the client sends the exact message
+`"[begin onboarding]"`; the server stamps `profile.onboarded = false` and,
+while the flag is false, injects an interview script into the system
+prompt — the agent asks the profile questions one at a time (their
+Mustang, planned upgrades, future purchase, shows/events, track days),
+records answers with `update_garage`, then calls the `complete_onboarding`
+tool, which sets `profile.onboarded = true` (the client's cue to unlock
+navigation) and thanks the user. The sentinel message is hidden from
+transcript replays and never becomes a chat title. `GET /garage/{user_id}`
+exposes the flag via `profile.onboarded`: `false` = interview in progress,
+`true` = done, absent = pre-onboarding user (grandfathered when their
+profile is non-empty).
 
 `user_id` is the LangGraph thread id: turns with the same user_id share
 conversation history via the Postgres checkpointer.

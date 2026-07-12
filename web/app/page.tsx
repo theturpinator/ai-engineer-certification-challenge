@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import ReactMarkdown from "react-markdown";
-import { apiFetch, AuthButton } from "./auth";
+import { apiFetch, AuthButton, needsOnboarding } from "./auth";
 import { DeltaChips, type Deltas } from "./chips";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -47,7 +47,12 @@ const TOOL_STATUS: Record<string, string> = {
   recommend_products: "Finding products…",
   update_garage: "Updating your garage…",
   update_instructions: "Noting your preference…",
+  complete_onboarding: "Saving your profile…",
 };
+
+// First-run onboarding (issue #46): this hidden message opens a brand-new
+// user's chat; the agent interviews them until complete_onboarding fires.
+const ONBOARD_KICKOFF = "[begin onboarding]";
 
 // The server pings every ~10s whenever nothing else is streaming, so this
 // long a silence can only mean a dead connection — not a slow tool call.
@@ -105,150 +110,6 @@ function ago(iso: string) {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
-// --- Standardized car intake (issue #15) ---
-
-const YEARS = Array.from({ length: 2027 - 1964 + 1 }, (_, i) => String(2027 - i));
-const TRIMS = ["Base", "EcoBoost", "GT", "Mach 1", "Bullitt", "Boss 302", "Boss 429",
-  "LX", "SVO", "Cobra", "GT350", "GT500", "Dark Horse", "Other"];
-const COLORS = ["Black", "White", "Silver", "Gray", "Red", "Race Red", "Blue",
-  "Grabber Blue", "Green", "Yellow", "Orange", "Burgundy", "Brown", "Purple", "Other"];
-
-type NewCar = { year: number; trim: string; color: string; nickname?: string };
-
-function AddCarModal({
-  uid,
-  onClose,
-  onAdded,
-}: {
-  uid: string;
-  onClose: () => void;
-  onAdded: (car: NewCar) => void;
-}) {
-  const [year, setYear] = useState("");
-  const [trim, setTrim] = useState("");
-  const [trimOther, setTrimOther] = useState("");
-  const [color, setColor] = useState("");
-  const [colorOther, setColorOther] = useState("");
-  const [nickname, setNickname] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [err, setErr] = useState("");
-
-  const finalTrim = trim === "Other" ? trimOther.trim() : trim;
-  const finalColor = color === "Other" ? colorOther.trim() : color;
-  const ready = year && finalTrim && finalColor;
-
-  async function save() {
-    setSaving(true);
-    setErr("");
-    try {
-      const r = await apiFetch(`${API_URL}/garage/${uid}/cars`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          year: parseInt(year, 10),
-          trim: finalTrim,
-          color: finalColor,
-          nickname: nickname.trim() || undefined,
-        }),
-      });
-      if (r.status === 409) throw new Error("dup");
-      if (r.status === 400) throw new Error("full"); // 10-car cap (issue #35)
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      onAdded(await r.json());
-    } catch (e) {
-      const kind = e instanceof Error ? e.message : "";
-      setErr(
-        kind === "dup"
-          ? "That year and trim is already in your garage."
-          : kind === "full"
-            ? "Garage is full — max 10 cars. Delete one in My Garage first."
-            : "Couldn’t save — please try again."
-      );
-      setSaving(false);
-    }
-  }
-
-  return (
-    <div className="modal" onClick={onClose}>
-      <div
-        className="sheet"
-        onClick={(e) => e.stopPropagation()}
-        role="dialog"
-        aria-label="Add your car"
-      >
-        <h2>Add your car</h2>
-        <p className="empty">Ford Mustang — pick the year, trim, and color.</p>
-        <div className="editgrid">
-          <label>
-            <span className="fieldlabel">Year *</span>
-            <select value={year} onChange={(e) => setYear(e.target.value)}>
-              <option value="">Select…</option>
-              {YEARS.map((y) => (
-                <option key={y} value={y}>{y}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            <span className="fieldlabel">Trim *</span>
-            <select value={trim} onChange={(e) => setTrim(e.target.value)}>
-              <option value="">Select…</option>
-              {TRIMS.map((t) => (
-                <option key={t} value={t}>{t}</option>
-              ))}
-            </select>
-          </label>
-          {trim === "Other" && (
-            <label>
-              <span className="fieldlabel">Trim name *</span>
-              <input
-                value={trimOther}
-                onChange={(e) => setTrimOther(e.target.value)}
-                placeholder="e.g. Grande"
-              />
-            </label>
-          )}
-          <label>
-            <span className="fieldlabel">Color *</span>
-            <select value={color} onChange={(e) => setColor(e.target.value)}>
-              <option value="">Select…</option>
-              {COLORS.map((c) => (
-                <option key={c} value={c}>{c}</option>
-              ))}
-            </select>
-          </label>
-          {color === "Other" && (
-            <label>
-              <span className="fieldlabel">Color name *</span>
-              <input
-                value={colorOther}
-                onChange={(e) => setColorOther(e.target.value)}
-                placeholder="e.g. Eleanor Gray"
-              />
-            </label>
-          )}
-          <label>
-            <span className="fieldlabel">Nickname</span>
-            <input
-              value={nickname}
-              onChange={(e) => setNickname(e.target.value)}
-              placeholder="Optional"
-            />
-          </label>
-        </div>
-        {err && <p className="formerr">{err}</p>}
-        <div className="editactions">
-          <button type="button" className="secondary" onClick={onClose} disabled={saving}>
-            Cancel
-          </button>
-          <button type="button" onClick={save} disabled={saving || !ready}>
-            {saving ? "Saving…" : "Save"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 export default function Chat() {
   // Per-chat buffers: an in-flight stream keeps writing into its own chat's
   // thread, so switching away and back never corrupts what's on screen.
@@ -258,9 +119,11 @@ export default function Chat() {
   const [chats, setChats] = useState<ChatMeta[]>([]);
   const [drawer, setDrawer] = useState(false);
   const [chatId, setChatId] = useState("");
-  const [picker, setPicker] = useState(false);
-  const [carPrompt, setCarPrompt] = useState(false);
-  const [garageFull, setGarageFull] = useState(false);
+  // First-run onboarding (issue #46): the agent interviews the user in this
+  // chat; until complete_onboarding flips the server flag, all navigation
+  // away from the conversation is hidden.
+  const [onboarding, setOnboarding] = useState(false);
+  const onboardingRef = useRef(false);
   const userId = useRef<string>("");
   const sessionId = useRef<string>("");
   const streamingRef = useRef<Record<string, boolean>>({});
@@ -309,17 +172,17 @@ export default function Chat() {
     sessionId.current = sid;
     // "default" is the pre-multi-chat thread, so existing history shows up.
     setChatId(localStorage.getItem("md_chat_id") || "default");
-    // Empty garage -> suggest the picker (once; dismissal sticks).
-    // Full garage -> the add-car chip gives way to a garage-full note (#35).
+    // A user we know nothing about gets interviewed before anything else:
+    // lock the nav and have the agent start the conversation. A missing
+    // server flag means the kickoff was never sent; false = in progress
+    // (mid-interview reload), so just re-lock and let them keep answering.
     apiFetch(`${API_URL}/garage/${id}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((g) => {
-        if (!g) return;
-        const count = g.profile?.cars?.length ?? 0;
-        setGarageFull(count >= 10);
-        if (count === 0 && localStorage.getItem("md_addcar_prompt") !== "dismissed") {
-          setCarPrompt(true);
-        }
+        if (!g || !needsOnboarding(g)) return;
+        onboardingRef.current = true;
+        setOnboarding(true);
+        if (g.profile?.onboarded === undefined) send(ONBOARD_KICKOFF);
       })
       .catch(() => {});
   }, []);
@@ -349,7 +212,6 @@ export default function Chat() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       setDrawer(false);
-      setPicker(false);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -379,34 +241,19 @@ export default function Chat() {
     switchTo(crypto.randomUUID().slice(0, 8));
   }
 
-  function dismissCarPrompt() {
-    setCarPrompt(false);
-    localStorage.setItem("md_addcar_prompt", "dismissed");
-  }
-
-  function carAdded(car: NewCar) {
-    setPicker(false);
-    setCarPrompt(false);
-    // client-side confirmation only — not an LLM turn, not in the transcript
-    updateThread(chatKey(chatId), (m) => [
-      ...m,
-      {
-        role: "assistant",
-        content: `🏁 Added your ${car.year} Mustang ${car.trim} to the garage — check My Garage!`,
-      },
-    ]);
-  }
-
   async function send(textArg?: string) {
     const text = (textArg ?? input).trim();
     const k = chatKey(chatId); // captured: every write below targets THIS chat
     if (!text || streaming[k]) return;
     if (textArg === undefined) setInput("");
+    // The onboarding kickoff is machine-sent: no user bubble, and the server
+    // hides it from transcript replays too.
+    const hidden = text === ONBOARD_KICKOFF;
     setStreamFlag(k, true);
     updateThread(k, (m) => [
       ...m,
-      { role: "user", content: text },
-      { role: "assistant", content: "" },
+      ...(hidden ? [] : [{ role: "user" as const, content: text }]),
+      { role: "assistant" as const, content: "" },
     ]);
 
     try {
@@ -438,8 +285,12 @@ export default function Chat() {
       let buffer = "";
       // Text streamed before a tool event is search narration ("Let me
       // search…"), not answer — drop it when the tool fires (issue #45).
-      // Only the post-last-tool segment survives as the answer bubble.
+      // Only the post-last-tool segment survives as the answer bubble —
+      // unless nothing follows the last tool (the model replied first,
+      // then called e.g. complete_onboarding): then the "narration" was
+      // the reply, and it comes back at stream end (issue #46).
       let bubbleText = ""; // what has streamed into the current bubble
+      let wiped = ""; // last pre-tool segment, restored if the stream ends bare
       // Ads arrive mid-stream, right after their tool event. Hold every one
       // until the stream completes, then attach to the trailing (answer)
       // bubble — below the finished text — so cards never interleave with
@@ -465,6 +316,7 @@ export default function Chat() {
           } else if (parsed.type === "tool") {
             if (bubbleText) {
               // wipe the narration that streamed ahead of this tool call
+              wiped = bubbleText;
               patchLast(k, (last) => ({ ...last, content: "" }));
               bubbleText = "";
             }
@@ -483,6 +335,11 @@ export default function Chat() {
           // "ping" events just feed the watchdog
         }
       }
+      if (!bubbleText && wiped) {
+        // the turn ended on a tool call — the wiped text was the reply
+        const text = wiped;
+        patchLast(k, (last) => ({ ...last, status: undefined, content: text }));
+      }
       if (heldAds.length) {
         // stream done: cards land at the end of the answer bubble in one go
         const ads = heldAds;
@@ -499,6 +356,18 @@ export default function Chat() {
       }));
     } finally {
       setStreamFlag(k, false);
+      if (onboardingRef.current) {
+        // unlock the moment the turn's complete_onboarding call landed
+        apiFetch(`${API_URL}/garage/${userId.current}`)
+          .then((r) => (r.ok ? r.json() : null))
+          .then((g) => {
+            if (g && !needsOnboarding(g)) {
+              onboardingRef.current = false;
+              setOnboarding(false);
+            }
+          })
+          .catch(() => {});
+      }
     }
   }
 
@@ -517,9 +386,6 @@ export default function Chat() {
 
   return (
     <main>
-      {picker && (
-        <AddCarModal uid={userId.current} onClose={() => setPicker(false)} onAdded={carAdded} />
-      )}
       {drawer && (
         <div className="backdrop" onClick={() => setDrawer(false)}>
           <aside className="drawer" onClick={(e) => e.stopPropagation()} aria-label="Chats">
@@ -545,35 +411,24 @@ export default function Chat() {
         </div>
       )}
       <header>
-        <button type="button" className="menubtn" aria-label="Chats" onClick={openDrawer}>
-          ☰
-        </button>
+        {/* onboarding locks the site to this conversation: no drawer, no nav */}
+        {!onboarding && (
+          <button type="button" className="menubtn" aria-label="Chats" onClick={openDrawer}>
+            ☰
+          </button>
+        )}
         Ask MustangDriver
-        <nav>
-          <AuthButton />
-          <Link href="/profile">Profile</Link>
-          <Link href="/garage">My Garage</Link>
-        </nav>
+        {!onboarding && (
+          <nav>
+            <AuthButton />
+            <Link href="/profile">Profile</Link>
+            <Link href="/garage">My Garage</Link>
+          </nav>
+        )}
       </header>
       <div className="messages">
-        {carPrompt && (
-          <div className="garageprompt">
-            <span>Got a Mustang? Add it to your garage in a few taps.</span>
-            <button type="button" className="addcarchip" onClick={() => setPicker(true)}>
-              + Add your car
-            </button>
-            <button
-              type="button"
-              className="dismiss"
-              aria-label="Dismiss"
-              onClick={dismissCarPrompt}
-            >
-              ×
-            </button>
-          </div>
-        )}
         {/* only after the transcript fetch lands, so history never flashes it */}
-        {threads[chatKey(chatId)] !== undefined && messages.length === 0 && (
+        {!onboarding && threads[chatKey(chatId)] !== undefined && messages.length === 0 && (
           <div className="welcome">
             <p>
               Your Mustang copilot — maintenance, mods, recalls, history, and
@@ -632,15 +487,6 @@ export default function Chat() {
         ))}
         <div ref={bottom} />
       </div>
-      <div className="chiprow">
-        {garageFull ? (
-          <span className="empty">Garage is full — max 10 cars.</span>
-        ) : (
-          <button type="button" className="addcarchip" onClick={() => setPicker(true)}>
-            + Add your car
-          </button>
-        )}
-      </div>
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -660,7 +506,7 @@ export default function Chat() {
             e.preventDefault();
             send();
           }}
-          placeholder="Ask about Mustangs…"
+          placeholder={onboarding ? "Type your answer…" : "Ask about Mustangs…"}
           aria-label="Message"
         />
         <button type="submit" disabled={busy || !input.trim()}>

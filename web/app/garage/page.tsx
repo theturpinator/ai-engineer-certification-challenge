@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { apiFetch, AuthButton } from "../auth";
+import { apiFetch, AuthButton, needsOnboarding } from "../auth";
 import { DeltaChips, type Deltas } from "../chips";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -586,6 +586,11 @@ export default function GaragePage() {
     apiFetch(`${API_URL}/garage/${uid}`)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((g: Garage) => {
+        if (needsOnboarding(g)) {
+          // onboarding isn't finished — the chat interview comes first (#46)
+          window.location.replace("/");
+          return;
+        }
         setGarage(g);
         if (tick < 3 && g.profile?.cars?.some((c) => !c.stats)) {
           setTimeout(() => setTick((t) => t + 1), 10000);
