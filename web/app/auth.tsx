@@ -158,9 +158,16 @@ export function AuthButton() {
           type="button"
           className="signout"
           onClick={() => {
-            // md_user_id stays: this browser keeps its current garage
+            // Detach this browser from the account (issue #40): after login,
+            // md_user_id IS the canonical account id, and anonymous requests
+            // are authorized by plain user id — so it must rotate too, or a
+            // shared computer keeps reading the account's garage and chats.
+            // Signing back in restores everything via the google_sub mapping.
             localStorage.removeItem("md_auth");
-            setAuth(null);
+            localStorage.setItem("md_user_id", crypto.randomUUID());
+            localStorage.removeItem("md_chat_id");
+            sessionStorage.removeItem("md_session_id");
+            window.location.reload(); // every page refetches as a clean anon
           }}
         >
           Sign out
