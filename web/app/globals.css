@@ -351,6 +351,7 @@ button:disabled {
 .uploadpill {
   cursor: pointer;
   display: inline-block;
+  font-family: inherit; /* button.uploadpill (Rotate 90°) matches the label pill */
   background: rgba(20, 22, 27, 0.72);
   border: 1px solid rgba(255, 255, 255, 0.3);
   color: #e8e6e3;

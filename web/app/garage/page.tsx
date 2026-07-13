@@ -129,51 +129,109 @@ function Portrait({ url, children }: { url: string; children?: React.ReactNode }
   );
 }
 
-function UploadPhoto({
+/** Compress a picked photo in the browser (issue #53): decode via
+ * createImageBitmap (which bakes in EXIF orientation, curing sideways phone
+ * photos), downscale to ~2000px on the long edge, re-encode as JPEG at 0.85.
+ * Production rejects request bodies over ~4.5 MB at the platform layer, so
+ * client-side is the only place this can happen. `rotate` (degrees clockwise)
+ * drives the Rotate 90° affordance through the same path. */
+async function compressImage(source: Blob, rotate = 0): Promise<Blob> {
+  const bmp = await createImageBitmap(source);
+  const scale = Math.min(1, 2000 / Math.max(bmp.width, bmp.height));
+  const w = Math.round(bmp.width * scale);
+  const h = Math.round(bmp.height * scale);
+  const canvas = document.createElement("canvas");
+  const swap = rotate % 180 !== 0;
+  canvas.width = swap ? h : w;
+  canvas.height = swap ? w : h;
+  const ctx = canvas.getContext("2d")!;
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.rotate((rotate * Math.PI) / 180);
+  ctx.drawImage(bmp, -w / 2, -h / 2, w, h);
+  bmp.close();
+  return new Promise((res, rej) =>
+    canvas.toBlob((b) => (b ? res(b) : rej(new Error("encode failed"))), "image/jpeg", 0.85)
+  );
+}
+
+function PhotoControls({
   uid,
   carId,
+  uploaded,
+  imgUrl,
   onUploaded,
 }: {
   uid: string;
   carId: string;
+  uploaded: boolean; // the user's own photo is stored -> edit affordances
+  imgUrl: string;
   onUploaded: () => void;
 }) {
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<"" | "upload" | "rotate">("");
   const [err, setErr] = useState("");
-  // Always-visible pill overlaid on the portrait (no hover-reveal — mobile
-  // has no hover); the parent hides it entirely once a photo is uploaded.
+
+  async function put(blob: Blob) {
+    const r = await apiFetch(`${API_URL}/garage/${uid}/cars/${carId}/image`, {
+      method: "PUT",
+      headers: { "Content-Type": blob.type || "image/jpeg" },
+      body: blob,
+      signal: AbortSignal.timeout(120_000), // big photos beat the 30s default
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    onUploaded();
+  }
+
+  // Always-visible pills overlaid on the portrait (no hover-reveal — mobile
+  // has no hover). Before any upload: "Use my own photo". After: the photo
+  // keeps "Change photo" and "Rotate 90°" instead of going read-only.
   return (
     <div className="uploadoverlay">
       {err && <span className="formerr">{err}</span>}
       <label className="uploadpill">
-        {busy ? "Uploading…" : "Use my own photo"}
+        {busy === "upload" ? "Uploading…" : uploaded ? "Change photo" : "Use my own photo"}
         <input
           type="file"
           accept="image/*"
-          disabled={busy}
+          disabled={!!busy}
           onChange={async (e) => {
             const file = e.target.files?.[0];
             e.target.value = "";
             if (!file) return;
-            setBusy(true);
+            setBusy("upload");
             setErr("");
             try {
-              const r = await apiFetch(`${API_URL}/garage/${uid}/cars/${carId}/image`, {
-                method: "PUT",
-                headers: { "Content-Type": file.type || "image/jpeg" },
-                body: file,
-                signal: AbortSignal.timeout(120_000), // big photos beat the 30s default
-              });
-              if (!r.ok) throw new Error(`HTTP ${r.status}`);
-              onUploaded();
+              // undecodable format (e.g. HEIC on some browsers): send as-is
+              await put(await compressImage(file).catch(() => file));
             } catch {
-              setErr("Upload failed — try a smaller image (under 8 MB).");
+              setErr("Upload failed — please try again.");
             } finally {
-              setBusy(false);
+              setBusy("");
             }
           }}
         />
       </label>
+      {uploaded && (
+        <button
+          type="button"
+          className="uploadpill"
+          disabled={!!busy}
+          onClick={async () => {
+            setBusy("rotate");
+            setErr("");
+            try {
+              const r = await apiFetch(imgUrl);
+              if (!r.ok) throw new Error(`HTTP ${r.status}`);
+              await put(await compressImage(await r.blob(), 90));
+            } catch {
+              setErr("Rotate failed — please try again.");
+            } finally {
+              setBusy("");
+            }
+          }}
+        >
+          {busy === "rotate" ? "Rotating…" : "Rotate 90°"}
+        </button>
+      )}
     </div>
   );
 }
@@ -717,16 +775,16 @@ export default function GaragePage() {
                   <Portrait
                     url={`${API_URL}/garage/${uid}/cars/${car.id}/image?v=${imgVer}`}
                   >
-                    {!car.photo_uploaded && (
-                      <UploadPhoto
-                        uid={uid}
-                        carId={car.id}
-                        onUploaded={() => {
-                          setImgVer((v) => v + 1);
-                          patchCar(car.id, (c) => ({ ...c, photo_uploaded: true }));
-                        }}
-                      />
-                    )}
+                    <PhotoControls
+                      uid={uid}
+                      carId={car.id}
+                      uploaded={!!car.photo_uploaded}
+                      imgUrl={`${API_URL}/garage/${uid}/cars/${car.id}/image?v=${imgVer}`}
+                      onUploaded={() => {
+                        setImgVer((v) => v + 1);
+                        patchCar(car.id, (c) => ({ ...c, photo_uploaded: true }));
+                      }}
+                    />
                   </Portrait>
                   {car.stats ? (
                     <StatBars stats={car.stats} bars={car.bars} />
