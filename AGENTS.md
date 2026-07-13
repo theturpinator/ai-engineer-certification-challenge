@@ -15,6 +15,7 @@ Agentic RAG chatbot for MustangDriver.com. The spec is [GitHub issue #1](https:/
 | Local stack | `docker compose up -d` (Postgres :5433), then `cd api && uv run uvicorn app:app --port 8000` and `cd web && npm run dev` (Node 18+) |
 | API tests | `cd api && uv run pytest` — needs the repo-root `.env` and the compose Postgres; seam-1 suites call the real LLM |
 | Web typecheck/build | `cd web && npx tsc --noEmit && npm run build` |
+| Web e2e (Playwright) | `cd web && npm run e2e` — needs the compose Postgres; starts (or reuses) the API and web dev servers; records a video per test under `web/test-results/` (Node 18+) |
 | Article ingestion | `cd api && uv run python -m ingest` (reads `data/articles-clean.csv`, gitignored) |
 | Ads ingestion | `cd api && uv run python -m ingest_ads` (reads `data/ads.csv`, gitignored) — the roster-refresh path |
 | **Production deploy** | `./deploy.sh` from the repo root — api → health check → web → smoke check, fail-fast. Only after the ship gate. |

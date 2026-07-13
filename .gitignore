@@ -23,3 +23,8 @@ node_modules/
 # but the eval datasets are committed
 !evals/data/
 evals/data/kg.json
+
+# Playwright
+web/test-results/
+web/playwright-report/
+web/tsconfig.tsbuildinfo
