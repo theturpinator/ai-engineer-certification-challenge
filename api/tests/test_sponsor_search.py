@@ -30,8 +30,9 @@ async def test_live_sponsor_results_stream_as_sponsored_cards(monkeypatch):
             {"title": "1966 Mustang Taillight Bezel - Concours",
              "url": "https://www.npdlink.com/product/taillight-bezel-1966",
              "content": "Concours-correct taillight bezel for 1965-66 Mustangs."},
+            # a subdomain result still attributes to the sponsor
             {"title": "1966 Mustang Taillight Lens",
-             "url": "https://www.npdlink.com/product/taillight-lens-1966",
+             "url": "https://shop.npdlink.com/product/taillight-lens-1966",
              "content": "Show-quality replacement taillight lens."},
         ]
 
@@ -53,7 +54,7 @@ async def test_live_sponsor_results_stream_as_sponsored_cards(monkeypatch):
             ads = [e for e in events if e["type"] == "ad"]
             assert 1 <= len(ads) <= 3, ads
             live = [a for a in ads
-                    if (a["link"] or "").startswith("https://www.npdlink.com/product/")]
+                    if "npdlink.com/product/" in (a["link"] or "")]
             assert live, ads
             for ad in live:
                 assert ad["sponsored"] is True

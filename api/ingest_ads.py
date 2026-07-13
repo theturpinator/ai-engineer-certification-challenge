@@ -267,7 +267,9 @@ def catalog_entries(record: dict, analysis: dict) -> list[dict]:
         "id": record["slug"],
         "kind": "advertiser",
         "name": record["name"],
-        "recommendable": True,
+        # a where-to-buy card must link somewhere: an advertiser with no
+        # derivable website is ingested but never recommended
+        "recommendable": bool(record["website"] or base["link"]),
         "specific": False,  # a storefront, not an installable product
         "description": analysis.get("description", ""),
         "categories": sorted({c for p in products for c in p["categories"]}),

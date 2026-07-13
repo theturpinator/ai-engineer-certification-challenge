@@ -638,8 +638,11 @@ async def search_sponsor_sites(query: str, advertiser: str = "") -> str:
         return json.dumps([])
 
     def sponsor(url: str) -> str:
-        entry = sites.get(_domain_of(url))
-        return entry["advertiser"] if entry else _domain_of(url)
+        host = _domain_of(url)
+        for dom, entry in sites.items():
+            if host == dom or host.endswith("." + dom):  # subdomains too
+                return entry["advertiser"]
+        return host
 
     return json.dumps(
         [{"title": r["title"], "url": r["url"], "content": r["content"][:400],
@@ -1698,6 +1701,11 @@ async def chat(req: ChatRequest, auth_uid: AuthUid = None):
                         batch = []
                         for item in json.loads(msg.content):
                             entry = _SPONSOR_BY_NAME.get(item["advertiser"].lower())
+                            if not entry:
+                                # never a Sponsored card for an off-roster
+                                # domain (hard rule: only recommendation-
+                                # eligible advertisers are recommended)
+                                continue
                             batch.append({
                                 "type": "ad",
                                 "product": item["title"],

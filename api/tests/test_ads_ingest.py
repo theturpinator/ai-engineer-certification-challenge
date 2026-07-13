@@ -183,6 +183,16 @@ def test_vendor_gains_advertiser_level_entry():
     assert adv["deltas"] == zero_deltas()  # an advertiser isn't an upgrade
     assert "Vendor Co" in embed_text(adv) and "Parts vendor." in embed_text(adv)
 
+    # no derivable website anywhere -> ingested but never recommended
+    # (a where-to-buy card must link somewhere)
+    bare = advertiser_record(make_row(
+        **{"Website Link": "", "google ad link": "", "Banner Ad link": "",
+           "300x250 square ad link": "", "Client banner Ad": "",
+           "300x250 square image": ""}))
+    adv = next(e for e in catalog_entries(bare, analysis)
+               if e.get("kind") == "advertiser")
+    assert adv["recommendable"] is False
+
 
 def test_non_vendor_ingested_but_never_recommendable():
     rec = advertiser_record(make_row())
