@@ -6,8 +6,10 @@ stream failure (real exception server-log only), from a
 LangGraph ReAct agent with four tools: search_archive (in-memory Qdrant over
 index_artifact/, built at startup), web_search (Tavily, live web),
 check_recalls (NHTSA Recalls API), and recommend_products (intent-gated
-sponsored recommendations over the committed ads_artifact/ catalog via a
-mini BM25+dense RRF index; at most two `ad` events per turn, each carrying
+sponsored recommendations over the committed ads_artifact/ catalog — product
+entries plus advertiser-level entries whose card links the sponsor's
+canonical website — via a mini BM25+dense RRF index; at most three `ad`
+events per turn, each carrying
 the creative image, UTM click-through link, Sponsored flag, and stat-delta
 chips for the user's car), plus two memory tools: update_garage (semantic:
 the user's cars, per-car mods/wishlist with add, remove, and move
@@ -127,10 +129,13 @@ archive was empty, limited, or off-target, and never mention falling back.
 focus on…"). Call tools silently and give only the answer.
 - check_recalls for safety-recall questions; report the official NHTSA \
 campaigns (component, summary, remedy, date), or that none were found.
-- recommend_products ONLY when the user is shopping for a part or upgrade, \
-asks for upgrade advice, or the answer naturally calls for a specific \
-product. Call it at most once per turn. Weave the fitting product(s) into \
-your answer, naming the advertiser behind each. NEVER call it on history, \
+- recommend_products whenever the user is shopping for a part or upgrade, \
+asks where to buy something, asks for upgrade advice, or the answer \
+naturally calls for a specific product — ALWAYS call it before answering \
+such questions, never from memory alone. Call it at most once per turn. \
+Weave the fitting product(s) into your answer, naming the advertiser behind \
+each; on where-to-buy questions recommend the fitting sponsor's site when \
+the results include one. NEVER call it on history, \
 spec, lore, recall, news, or any question that doesn't call for buying \
 something — those answers stay purely editorial, exactly as before.
 
@@ -521,7 +526,7 @@ _GEN_KEYS = {re.sub(r"[^a-z0-9]", "", g.lower()): g for _lo, _hi, g in GENERATIO
 # retrieval experiments) over the RECOMMENDABLE catalog entries only: the
 # placeholder, charities, and giveaways are in the catalog but never in this
 # index. Entirely separate from the article index; no network at startup.
-AD_TOP_K = 2  # at most two sponsored cards per turn
+AD_TOP_K = 3  # at most three sponsored cards per turn (issue #50)
 _RRF_K = 60
 _RECO_ROWS = [i for i, e in enumerate(CATALOG) if e["recommendable"]]
 _RECO = [CATALOG[i] for i in _RECO_ROWS]

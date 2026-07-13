@@ -7,7 +7,9 @@ from ingest_ads import (
     GENERATION_NAMES,
     STATS,
     advertiser_record,
+    canonical_website,
     catalog_entries,
+    dedupe_records,
     embed_text,
     generic_entries,
     load_advertisers,
@@ -23,6 +25,8 @@ def make_row(**overrides):
         "Advertisers Name": "Vendor Co",
         "Slug": "vendor-co",
         "Active in website": "true",
+        "Updated On": "Tue Apr 05 2022 19:07:37 GMT+0000 (Coordinated Universal Time)",
+        "google ad link": "",
         "Client banner Ad": "https://cdn.example/banner.jpg",
         "Banner Ad link": UTM_LINK,
         "300x250 square image": "https://cdn.example/square.png",
@@ -35,7 +39,9 @@ def make_row(**overrides):
     return row
 
 
-def test_load_advertisers_actives_only(tmp_path):
+def test_load_advertisers_every_row_regardless_of_active_flag(tmp_path):
+    """Issue #50: the active-in-website filter is gone — the whole roster
+    enters the pipeline (the classification gate still rules eligibility)."""
     csv_path = tmp_path / "ads.csv"
     csv_path.write_text(
         "Advertisers Name,Slug,Active in website\n"
@@ -44,7 +50,71 @@ def test_load_advertisers_actives_only(tmp_path):
         "Blank Co,blank-co,\n"
     )
     rows = load_advertisers(csv_path)
-    assert [r["Slug"] for r in rows] == ["active-co"]
+    assert [r["Slug"] for r in rows] == ["active-co", "dead-co", "blank-co"]
+
+
+def test_canonical_website_fallback_chain():
+    # website column wins when present
+    assert canonical_website(make_row()) == "https://vendor.example"
+    # else the google-ad column, HTML tags stripped
+    row = make_row(**{"Website Link": "",
+                      "google ad link": '<p id="">https://ford.example/</p><p>x</p>'})
+    assert canonical_website(row) == "https://ford.example/"
+    # else the origin (scheme + host) of any creative click-through link
+    row = make_row(**{"Website Link": "", "google ad link": ""})
+    assert canonical_website(row) == "https://vendor.example"
+    # nothing derivable
+    row = make_row(**{"Website Link": "", "google ad link": "",
+                      "Banner Ad link": "", "300x250 square ad link": ""})
+    assert canonical_website(row) == ""
+
+
+NEWER = "Wed Mar 27 2024 10:00:00 GMT+0000 (Coordinated Universal Time)"
+
+
+def test_dedupe_collapses_same_domain_keeping_newest():
+    old = advertiser_record(make_row(
+        **{"Advertisers Name": "Vendor Giveaway 2022", "Slug": "vendor-2022",
+           "Client banner Ad": "https://cdn.example/old-banner.jpg"}))
+    new = advertiser_record(make_row(
+        **{"Advertisers Name": "Vendor Giveaway 2024", "Slug": "vendor-2024",
+           "Updated On": NEWER,
+           # same advertiser, different subpage — domain is the identity
+           "Website Link": "https://www.vendor.example/tickets/2024"}))
+    other = advertiser_record(make_row(
+        **{"Advertisers Name": "Unrelated Co", "Slug": "unrelated-co",
+           "Website Link": "https://other.example"}))
+    deduped = dedupe_records([old, new, other])
+    assert {r["slug"] for r in deduped} == {"vendor-2024", "unrelated-co"}
+    survivor = next(r for r in deduped if r["slug"] == "vendor-2024")
+    # merged rows keep their distinct creatives under the survivor
+    assert "https://cdn.example/old-banner.jpg" in [
+        c["image"] for c in survivor["creatives"]]
+
+
+def test_dedupe_falls_back_to_normalized_name():
+    a = advertiser_record(make_row(
+        **{"Advertisers Name": "Dream Give-a-Way", "Slug": "a", "Website Link": "",
+           "google ad link": "", "Banner Ad link": "", "300x250 square ad link": ""}))
+    b = advertiser_record(make_row(
+        **{"Advertisers Name": "dream give a way ", "Slug": "b", "Website Link": "",
+           "google ad link": "", "Banner Ad link": "", "300x250 square ad link": "",
+           "Updated On": NEWER}))
+    c = advertiser_record(make_row(
+        **{"Advertisers Name": "Other Charity", "Slug": "c", "Website Link": "",
+           "google ad link": "", "Banner Ad link": "", "300x250 square ad link": ""}))
+    deduped = dedupe_records([a, b, c])
+    assert {r["slug"] for r in deduped} == {"b", "c"}
+
+
+def test_dedupe_never_merges_distinct_advertisers_on_a_link_shortener():
+    a = advertiser_record(make_row(
+        **{"Advertisers Name": "Dash Cam Co", "Slug": "dash-cam-co",
+           "Website Link": "https://amzn.to/abc123"}))
+    b = advertiser_record(make_row(
+        **{"Advertisers Name": "Seat Cover Co", "Slug": "seat-cover-co",
+           "Website Link": "https://amzn.to/xyz789"}))
+    assert len(dedupe_records([a, b])) == 2
 
 
 def test_advertiser_record_creatives_square_first_and_deduped():
@@ -77,7 +147,7 @@ def test_vendor_products_become_recommendable_entries():
         ],
     }
     entries = catalog_entries(rec, analysis)
-    assert len(entries) == 2
+    assert len(entries) == 3  # two products + the advertiser-level entry
     e = entries[0]
     assert e["id"] == "vendor-co-tkx-5-speed-transmission"
     assert e["recommendable"] is True and e["sponsored"] is True
@@ -85,6 +155,33 @@ def test_vendor_products_become_recommendable_entries():
     assert e["image"] == "https://cdn.example/square.png"
     assert e["link"] == UTM_LINK
     assert e["deltas"] is None  # filled by the impure delta step
+    assert "kind" not in e  # product entries keep their shape
+
+
+def test_vendor_gains_advertiser_level_entry():
+    """Issue #50: every vendor/service advertiser gets one advertiser-level
+    Sponsored entry linking to its canonical website — recommendable in chat,
+    never Upgrade Shop-eligible."""
+    rec = advertiser_record(make_row())
+    analysis = {
+        "classification": "product vendor",
+        "description": "Parts vendor.",
+        "products": [
+            {"name": "TKX", "description": "x", "categories": ["transmission"],
+             "keywords": [], "aliases": []},
+            {"name": "Headers", "description": "x", "categories": ["exhaust"],
+             "keywords": [], "aliases": []},
+        ],
+    }
+    adv = next(e for e in catalog_entries(rec, analysis)
+               if e.get("kind") == "advertiser")
+    assert adv["name"] == "Vendor Co" and adv["advertiser"] == "Vendor Co"
+    assert adv["recommendable"] is True and adv["sponsored"] is True
+    assert adv["specific"] is False  # not a concrete installable product
+    assert adv["link"] == "https://vendor.example"  # the canonical website
+    assert set(adv["categories"]) == {"transmission", "exhaust"}  # the union
+    assert adv["deltas"] == zero_deltas()  # an advertiser isn't an upgrade
+    assert "Vendor Co" in embed_text(adv) and "Parts vendor." in embed_text(adv)
 
 
 def test_non_vendor_ingested_but_never_recommendable():
@@ -94,6 +191,7 @@ def test_non_vendor_ingested_but_never_recommendable():
                                          "description": "x", "products": []})
         assert entry["recommendable"] is False and entry["sponsored"] is True
         assert entry["deltas"] == zero_deltas()  # all-zero, all generations
+        assert entry.get("kind") != "advertiser"  # no advertiser-level entry
     assert ELIGIBLE_CLASSIFICATIONS == {"product vendor", "service"}
 
 
@@ -124,7 +222,7 @@ def test_generation_names_match_app():
 
 
 def test_embed_text_carries_searchable_fields():
-    (entry,) = catalog_entries(
+    entry, _adv = catalog_entries(
         advertiser_record(make_row()),
         {"classification": "product vendor", "description": "d",
          "products": [{"name": "TKX", "description": "A 5-speed gearbox.",
@@ -147,13 +245,14 @@ def test_specific_flag_gates_shop_eligibility():
         {"name": "Restoration Parts Catalog", "specific": False, "description": "x",
          "categories": ["restoration parts"], "keywords": [], "aliases": []},
     ]
-    cam, line = catalog_entries(rec, {"classification": "product vendor",
-                                      "description": "d", "products": products})
+    cam, line, adv = catalog_entries(rec, {"classification": "product vendor",
+                                           "description": "d", "products": products})
     assert cam["specific"] is True and cam["recommendable"] is True
     assert line["specific"] is False and line["recommendable"] is True
+    assert adv["kind"] == "advertiser" and adv["specific"] is False
     # service products are never shop-eligible, even if flagged specific
-    (tour,) = catalog_entries(rec, {"classification": "service", "description": "d",
-                                    "products": [dict(products[0], name="Route 66 Tour")]})
+    tour, _adv = catalog_entries(rec, {"classification": "service", "description": "d",
+                                       "products": [dict(products[0], name="Route 66 Tour")]})
     assert tour["recommendable"] is True and tour["specific"] is False
     # non-vendor campaigns aren't specific; generics always are
     (camp,) = catalog_entries(rec, {"classification": "giveaway",

@@ -4,14 +4,27 @@ Run from api/ with the venv set up (see README.md):
 
     uv run python -m ingest_ads
 
-Reads ../data/ads.csv (the Webflow advertiser export, gitignored). Only rows
-marked active in the website enter the pipeline. Each advertiser's creative
+Reads ../data/ads.csv (the Webflow advertiser export, gitignored). Every row
+enters the pipeline regardless of the export's active flag (issue #50, a
+demo-scope decision). Near-duplicate rows (repeat giveaway campaigns, repeat
+event years, banner variants) are deduplicated before analysis: key = the
+canonical website's domain, fallback = normalized advertiser name; the
+newest row by the export's updated-on column wins and keeps the union of
+the merged rows' creatives. Each advertiser's canonical website is derived
+by a pure fallback chain (website column -> google-ad column with HTML
+stripped -> origin of any banner click-through link), then confirmed or
+corrected by the vision analysis. Each advertiser's creative
 images are vision-analyzed by the agent model (Sonnet via the AI Gateway) to
 classify the advertiser (product vendor / service / event / charity /
 giveaway / placeholder) and extract concrete products with categories,
-keywords, and aliases. Recommendation eligibility = active AND product-or-
+keywords, and aliases. Recommendation eligibility = product-or-
 service vendor; the AdSense placeholder, charities, and giveaways are
-ingested but never recommendable. Products additionally carry a `specific`
+ingested but never recommendable. Every vendor/service advertiser also gains
+one advertiser-level entry (kind = advertiser): recommendable, Sponsored,
+linking to the canonical website, embedded under the advertiser's name,
+description, and the union of its products' categories — how the agent
+answers "where should I buy X" with a sponsor's website. Advertiser entries
+are never Upgrade Shop-eligible. Products additionally carry a `specific`
 flag (a concrete installable product vs a broad product line or service):
 only specific products appear in the garage Upgrade Shop; broad lines and
 services stay chat-recommendable only. Generic mod categories (supercharger,
@@ -35,7 +48,9 @@ import csv
 import json
 import mimetypes
 import re
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 API_DIR = Path(__file__).parent
 CSV_PATH = API_DIR.parent / "data" / "ads.csv"
@@ -99,15 +114,90 @@ def zero_deltas() -> dict:
 
 
 def load_advertisers(csv_path) -> list[dict]:
-    """The rows marked active in the website — the roster the pipeline ingests."""
+    """Every row in the export — the active flag no longer gates ingestion
+    (issue #50); the classification gate still rules recommendability."""
     with open(csv_path, newline="") as f:
-        return [r for r in csv.DictReader(f) if r.get("Active in website") == "true"]
+        return list(csv.DictReader(f))
+
+
+_URL_RE = re.compile(r"https?://[^\s\"'<>]+|www\.[^\s\"'<>]+")
+
+
+def _first_url(text: str) -> str:
+    """The first URL in free text, HTML tags stripped; '' when none."""
+    m = _URL_RE.search(re.sub(r"<[^>]+>", " ", text or ""))
+    if not m:
+        return ""
+    url = m.group().rstrip(".,;)")
+    return url if url.startswith("http") else f"https://{url}"
+
+
+def canonical_website(row: dict) -> str:
+    """Mechanical canonical-website chain (issue #50): the website column,
+    else the google-ad column (HTML stripped), else the origin (scheme +
+    host) of any creative click-through link. The vision analysis later
+    confirms/corrects the result (campaign microsites, CDN artifacts)."""
+    for col in ("Website Link", "google ad link"):
+        url = _first_url(row.get(col) or "")
+        if url:
+            return url
+    for _img_col, link_col in CREATIVE_COLUMNS:
+        url = _first_url(row.get(link_col) or "")
+        if url:
+            p = urlparse(url)
+            return f"{p.scheme}://{p.netloc}"
+    return ""
+
+
+def _domain(url: str) -> str:
+    return urlparse(url).netloc.lower().removeprefix("www.")
+
+
+def _norm_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", name.lower())
+
+
+def _parse_updated(raw: str) -> datetime:
+    """Webflow's 'Tue Apr 05 2022 19:07:37 GMT+0000 (...)'; min when blank."""
+    try:
+        return datetime.strptime(" ".join(raw.split()[:5]), "%a %b %d %Y %H:%M:%S")
+    except ValueError:
+        return datetime.min
+
+
+# ponytail: link shorteners aren't advertiser identities — extend if the
+# roster ever gains more of them
+_SHORTENER_DOMAINS = frozenset({"amzn.to"})
+
+
+def dedupe_records(records: list[dict]) -> list[dict]:
+    """Near-duplicate advertisers collapse (issue #50): same canonical-website
+    domain (else normalized name) = same advertiser. The newest row wins and
+    keeps the union of the merged rows' creatives, so no product is lost."""
+    groups: dict[str, list[dict]] = {}
+    for rec in records:
+        dom = _domain(rec["website"])
+        key = dom if dom and dom not in _SHORTENER_DOMAINS else _norm_name(rec["name"])
+        groups.setdefault(key, []).append(rec)
+    out = []
+    for group in groups.values():
+        group.sort(key=lambda r: r["updated"], reverse=True)
+        survivor = group[0]
+        seen = {c["image"] for c in survivor["creatives"]}
+        for other in group[1:]:
+            for c in other["creatives"]:
+                if c["image"] not in seen:
+                    seen.add(c["image"])
+                    survivor["creatives"].append(c)
+        out.append(survivor)
+    return out
 
 
 def advertiser_record(row: dict) -> dict:
-    """Name, slug, website, and creatives (image + its click-through link, UTM
-    untouched), deduped, in card-display preference order (square first)."""
-    website = (row.get("Website Link") or "").strip()
+    """Name, slug, canonical website, updated-on (the dedup tiebreaker), and
+    creatives (image + its click-through link, UTM untouched), deduped, in
+    card-display preference order (square first)."""
+    website = canonical_website(row)
     creatives, seen = [], set()
     for img_col, link_col in CREATIVE_COLUMNS:
         img = (row.get(img_col) or "").strip()
@@ -120,6 +210,7 @@ def advertiser_record(row: dict) -> dict:
         "name": row["Advertisers Name"].strip(),
         "slug": row["Slug"].strip(),
         "website": website,
+        "updated": _parse_updated(row.get("Updated On") or ""),
         "creatives": creatives,
     }
 
@@ -128,9 +219,12 @@ def catalog_entries(record: dict, analysis: dict) -> list[dict]:
     """Sponsor catalog entries for one advertiser given its vision analysis.
 
     Vendor/service advertisers yield one recommendable entry per extracted
-    product; anything else (placeholder, charity, giveaway, event) stays a
-    single non-recommendable entry — ingested, never recommended. Recommendable
-    entries leave deltas None for the impure delta step to fill."""
+    product plus one advertiser-level entry (kind = advertiser, issue #50) —
+    Sponsored, linking to the canonical website, embedded under the union of
+    its products' categories, never Upgrade Shop-eligible. Anything else
+    (placeholder, charity, giveaway, event) stays a single non-recommendable
+    entry — ingested, never recommended. Recommendable product entries leave
+    deltas None for the impure delta step to fill."""
     cls = analysis.get("classification", "")
     creative = (record["creatives"] or [{"image": None, "link": record["website"] or None}])[0]
     base = {
@@ -154,7 +248,7 @@ def catalog_entries(record: dict, analysis: dict) -> list[dict]:
             "aliases": [],
             "deltas": zero_deltas(),
         }]
-    return [{
+    products = [{
         **base,
         "id": f"{record['slug']}-{slugify(p['name'])}",
         "name": p["name"],
@@ -168,6 +262,21 @@ def catalog_entries(record: dict, analysis: dict) -> list[dict]:
         "aliases": p.get("aliases", []),
         "deltas": None,
     } for p in analysis.get("products", [])]
+    advertiser = {
+        **base,
+        "id": record["slug"],
+        "kind": "advertiser",
+        "name": record["name"],
+        "recommendable": True,
+        "specific": False,  # a storefront, not an installable product
+        "description": analysis.get("description", ""),
+        "categories": sorted({c for p in products for c in p["categories"]}),
+        "keywords": [],
+        "aliases": [],
+        "link": record["website"] or base["link"],
+        "deltas": zero_deltas(),  # an advertiser isn't an upgrade
+    }
+    return products + [advertiser]
 
 
 def generic_entries() -> list[dict]:
@@ -231,6 +340,9 @@ Ad click-through link: {link}
 Classify the advertiser and extract what they sell. Reply with ONLY this JSON:
 {{"classification": "product vendor" | "service" | "event" | "charity" | \
 "giveaway" | "placeholder",
+ "website": "<the advertiser's canonical homepage URL — correct campaign \
+microsites, CDN artifacts, and link-shortener URLs to the real homepage when \
+you know it; '' if unknown>",
  "description": "<one line: who this advertiser is>",
  "products": [{{"name": "<specific product or product line, not just the brand>",
    "specific": <true only for a concrete installable product an owner could \
@@ -353,11 +465,13 @@ def main():
     from ingest import embed  # same gateway embedding path as the article index
 
     rows = load_advertisers(CSV_PATH)
-    print(f"{len(rows)} active advertisers")
+    records = dedupe_records([advertiser_record(r) for r in rows])
+    print(f"{len(rows)} roster rows -> {len(records)} advertisers after dedup")
     entries = []
-    for row in rows:
-        record = advertiser_record(row)
+    for record in records:
         analysis = analyze_advertiser(record)
+        # the vision call confirms/corrects the mechanical website chain
+        record["website"] = _first_url(analysis.get("website", "")) or record["website"]
         made = catalog_entries(record, analysis)
         print(f"  {record['name']}: {analysis.get('classification')} -> "
               f"{len(made)} entries ({'recommendable' if made and made[0]['recommendable'] else 'not recommendable'})")

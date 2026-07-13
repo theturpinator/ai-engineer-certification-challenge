@@ -24,4 +24,4 @@ Agentic RAG chatbot for MustangDriver.com. The spec is [GitHub issue #1](https:/
 
 - Raw CSVs live in `data/` (gitignored) — never commit them. The derived artifacts (`api/index_artifact/`, `api/ads_artifact/`) **are** committed.
 - The article index, archive citations, and published eval results (`evals/results/`) are graded artifacts — features must not touch them.
-- Sponsored content is always labeled Sponsored, capped at two cards per chat turn, and only recommendation-eligible advertisers (active product/service vendors) are ever recommended.
+- Sponsored content is always labeled Sponsored, capped at three cards per chat turn, and only recommendation-eligible advertisers (product/service vendors — the export's active flag no longer gates eligibility, a demo-scope decision from #48) are ever recommended.

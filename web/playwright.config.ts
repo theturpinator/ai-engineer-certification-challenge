@@ -20,7 +20,9 @@ export default defineConfig({
       timeout: 60_000,
     },
     {
-      command: "npm run dev",
+      // a prior `npm run build` leaves production chunks in .next that make
+      // the dev server 404 its own bundles (page never hydrates) — start clean
+      command: "rm -rf .next && npm run dev",
       url: "http://localhost:3000",
       reuseExistingServer: true,
       timeout: 60_000,

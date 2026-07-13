@@ -23,7 +23,7 @@ def _delta(entry_id: str, gen: str, stat: str) -> int:
 @pytest.mark.asyncio
 async def test_product_intent_streams_sponsored_cards(monkeypatch):
     """A shopping question routes to recommend_products and streams at most
-    two ad events, each carrying the full sponsored-card payload with delta
+    three ad events, each carrying the full sponsored-card payload with delta
     chips resolved for the active car's generation."""
 
     async def no_enrich(uid):
@@ -49,7 +49,7 @@ async def test_product_intent_streams_sponsored_cards(monkeypatch):
             tools = [e["name"] for e in events if e["type"] == "tool"]
             assert "recommend_products" in tools, tools
             ads = [e for e in events if e["type"] == "ad"]
-            assert 1 <= len(ads) <= 2, ads
+            assert 1 <= len(ads) <= 3, ads
             recommendable_names = {e["name"] for e in CATALOG if e["recommendable"]}
             for ad in ads:
                 assert ad["sponsored"] is True
@@ -61,6 +61,26 @@ async def test_product_intent_streams_sponsored_cards(monkeypatch):
                 assert ad["product"] in recommendable_names, ad
             answer = "".join(e["text"] for e in events if e["type"] == "token")
             assert len(answer) > 50
+
+
+@pytest.mark.asyncio
+async def test_where_to_buy_streams_an_advertiser_website_card():
+    """Issue #50: a where-to-buy question surfaces an advertiser-level
+    Sponsored card linking the sponsor's website — the roster answer, not
+    just individual ad-creative products — and never more than three cards."""
+    advertiser_links = {e["link"] for e in CATALOG if e.get("kind") == "advertiser"}
+    assert advertiser_links  # the regenerated artifact carries advertiser entries
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            events = await collect_events(
+                client, "Where should I buy a cat-back exhaust for my Mustang?",
+                str(uuid.uuid4()),
+            )
+            ads = [e for e in events if e["type"] == "ad"]
+            assert 1 <= len(ads) <= 3, ads
+            assert all(ad["sponsored"] is True for ad in ads)
+            assert any(ad["link"] in advertiser_links for ad in ads), ads
 
 
 @pytest.mark.asyncio

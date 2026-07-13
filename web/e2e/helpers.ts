@@ -28,6 +28,10 @@ export async function actAsUser(page: Page, userId: string): Promise<void> {
  * narration the client wipes when a tool call fires. Returns the answer
  * bubble. */
 export async function sendMessage(page: Page, text: string): Promise<Locator> {
+  // Wait for a client-only render (welcome block or a message bubble): text
+  // filled before Next.js hydration never reaches React state, leaving Send
+  // disabled forever.
+  await page.locator(".welcome, .msg").first().waitFor({ timeout: 15_000 });
   const composer = page.locator("form textarea");
   await composer.fill(text);
   const streamed = page.waitForResponse(

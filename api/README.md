@@ -33,12 +33,13 @@ uv run uvicorn app:app --port 8000
      be interleaved with tokens; zero or more)
   3. `data: {"type": "token", "text": "..."}` — one event per token as the model generates
   4. `data: {"type": "ad", "product": str, "advertiser": str, "description": str, "image": url, "link": url, "sponsored": true, "deltas": {"power": int, ...} | null}` —
-     at most two per turn, only when the agent judged the question product-intent
+     at most three per turn, only when the agent judged the question product-intent
      and called `recommend_products`; `deltas` carries the nine-stat change
      (five performance + four ownership: style, comfort, safety, reliability)
      for the user's first garage car's generation (null when no car is known).
      `link` is the advertiser's click-through URL with its existing UTM
-     parameters; `image` is the hotlinked creative.
+     parameters (an advertiser-level entry links the sponsor's canonical
+     website instead); `image` is the hotlinked creative.
   5. `data: {"type": "ping"}` — keepalive whenever ~10s (`CHAT_PING_SECONDS`)
      pass with nothing else to send; clients treat any event as proof of life
      and may declare the connection dead after ~30s of total silence
