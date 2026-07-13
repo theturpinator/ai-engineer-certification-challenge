@@ -129,3 +129,35 @@ async def test_removal_conversation_removes_mod(monkeypatch):
             mods = [m.lower() for m in car.get("mods", [])]
             assert not any("intake" in m for m in mods), car
             assert any("borla" in m for m in mods), car
+
+
+@pytest.mark.asyncio
+async def test_wishlist_without_identity_never_spawns_a_phantom_car():
+    """Issue #52: mods/wishlist facts with no identifying field must not
+    create an identity-less car — the tool refuses and points the agent at
+    goals instead (a car-less user's planned upgrades stay profile goals)."""
+    from app import update_garage
+
+    user_id = str(uuid.uuid4())
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            result = await update_garage.ainvoke(
+                {"type": "tool_call", "name": "update_garage", "id": "t1",
+                 "args": {"wishlist": ["supercharger"]}},
+                config={"configurable": {"user_id": user_id}},
+            )
+            assert "goal" in str(result.content).lower()
+            profile = (await client.get(f"/garage/{user_id}")).json()["profile"]
+            assert not profile.get("cars"), profile
+
+            # goals passed alongside still merge; still no car
+            result = await update_garage.ainvoke(
+                {"type": "tool_call", "name": "update_garage", "id": "t2",
+                 "args": {"wishlist": ["supercharger"],
+                          "goals": ["Planned upgrade: supercharger"]}},
+                config={"configurable": {"user_id": user_id}},
+            )
+            profile = (await client.get(f"/garage/{user_id}")).json()["profile"]
+            assert profile.get("goals") == ["Planned upgrade: supercharger"], profile
+            assert not profile.get("cars"), profile

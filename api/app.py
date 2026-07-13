@@ -201,11 +201,19 @@ message, always waiting for the user's reply before the next:
 the user as Jake", and use their name from then on)
 2. Do you have a Mustang? If yes, ask what it is (year, trim, color, and a \
 nickname if it has one) and record it with update_garage. Partial answers \
-are fine — ask once for anything missing, then move on.
-3. Are you planning any upgrades or mods? (yes → update_garage goal \
-"Planning upgrades")
-4. Do you think you'll buy another Mustang some day? (yes → goal \
-"Shopping for a future Mustang")
+are fine — but if the color wasn't given, ask for the color once (never a \
+second time). Then ask whether they have any more Mustangs, exactly once: \
+a reply can list several cars — record every one with update_garage — but \
+never repeat the question after that one ask.
+3. Are you planning any upgrades or mods? If yes, record goal "Planning \
+upgrades", then ask WHICH upgrades they have in mind, and record each named \
+upgrade with update_garage as a wishlist item on their car (their first car \
+if they have several; when they have no car, record each as a goal instead, \
+e.g. "Planned upgrade: supercharger"). If their yes already names the \
+upgrades, record them and skip the follow-up.
+4. ONLY if the user has no Mustang: are you planning to buy one? (yes → \
+goal "Shopping for a future Mustang"). NEVER ask this of someone who \
+already has a Mustang — skip straight to the next question.
 5. Want to keep up with car shows and events? (yes → goal "Interested in \
 car shows and events")
 6. Are you into track days — or want to be? (yes → goal "Track days")
@@ -988,7 +996,7 @@ async def update_garage(
     removals = {k: v for k, v in dict(mods=remove_mods,
                                       wishlist=remove_wishlist).items() if v}
     missed: list[str] = []
-    full = False
+    full = no_car = False
     async with await _db() as conn:
         # ponytail: read-merge-write, no row lock; fine for one-user-per-thread chat
         profile = await _load_profile(conn, user_id)
@@ -999,6 +1007,12 @@ async def update_garage(
                 return "No matching car in the garage; nothing removed."
             if target is None and len(cars) >= MAX_CARS:
                 full = True  # skip the car; goals (if any) still merge below
+            elif target is None and not any(
+                    k in updates for k in
+                    ("year", "trim", "generation", "color", "nickname")):
+                # mods/wishlist with no identity must not spawn a phantom car
+                # (issue #52: a car-less user's planned upgrades stay goals)
+                no_car = True
             else:
                 if target is None:
                     target = {"id": uuid.uuid4().hex[:8]}
@@ -1025,6 +1039,10 @@ async def update_garage(
         return (f"{GARAGE_FULL_MSG}. The new car was NOT saved — tell the "
                 "user they must delete a car from their garage before "
                 "adding another.")
+    if no_car:
+        return ("There is no car in the garage to attach mods or a wishlist "
+                "to. Record the intent as a goal instead (e.g. goals="
+                "['Planned upgrade: supercharger']), or record the car first.")
     if missed:
         return ("Garage profile updated, but these weren't in the garage "
                 f"(nothing removed): {', '.join(missed)}. Tell the user "

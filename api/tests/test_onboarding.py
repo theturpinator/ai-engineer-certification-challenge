@@ -44,6 +44,79 @@ async def test_kickoff_stamps_flag_and_starts_interview():
             assert ONBOARD_KICKOFF[:60] not in titles, titles
 
 
+def _answer(events) -> str:
+    text = "".join(e["text"] for e in events if e["type"] == "token")
+    assert text, events
+    return text
+
+
+@pytest.mark.asyncio
+async def test_owner_interview_color_more_mustangs_wishlist_no_buy_question():
+    """Issue #52, owner path: a car given without color gets asked for the
+    color once; "any more Mustangs?" is asked once; a planned-upgrades yes
+    lands the named upgrades in the car's wishlist; the buy-a-Mustang
+    question is never asked of an owner."""
+    user_id = str(uuid.uuid4())
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            await collect_events(client, ONBOARD_KICKOFF, user_id)
+            await collect_events(client, "Call me Alex", user_id)
+            events = await collect_events(
+                client, "Yes! I have a 2016 Mustang GT", user_id)  # no color
+
+            # the car is recorded immediately and the color asked for
+            profile = (await client.get(f"/garage/{user_id}")).json()["profile"]
+            assert profile.get("cars"), profile
+            assert "color" in _answer(events).lower()
+
+            events = await collect_events(client, "It's red", user_id)
+            (car,) = (await client.get(f"/garage/{user_id}")).json()["profile"]["cars"]
+            assert (car.get("color") or "").lower() == "red", car
+            # color never re-asked; the one any-more-Mustangs ask comes next
+            follow_up = _answer(events).lower()
+            assert "color" not in follow_up
+            assert "more" in follow_up or "another" in follow_up or "other" in follow_up
+
+            events = await collect_events(client, "No, just the one", user_id)
+            # upgrades question; the answer names upgrades -> car wishlist
+            events = await collect_events(
+                client, "Yes — a supercharger and lowering springs", user_id)
+            (car,) = (await client.get(f"/garage/{user_id}")).json()["profile"]["cars"]
+            wishlist = " ".join(car.get("wishlist", [])).lower()
+            assert "supercharger" in wishlist, car
+            assert "spring" in wishlist or "lowering" in wishlist, car
+
+            # an owner is never asked about buying a Mustang
+            assert "buy" not in _answer(events).lower()
+
+
+@pytest.mark.asyncio
+async def test_non_owner_gets_buy_question_and_upgrades_land_as_goals():
+    """Issue #52, non-owner path: planned upgrades become profile goals when
+    there is no car, and the buy-a-Mustang question is asked."""
+    user_id = str(uuid.uuid4())
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            await collect_events(client, ONBOARD_KICKOFF, user_id)
+            asked = []  # the interview's questions, in order
+            for reply in ("Sam", "No Mustang yet",
+                          "Yes, I'd love a cold air intake eventually",
+                          "That's all for upgrades"):
+                events = await collect_events(client, reply, user_id)
+                asked.append(_answer(events).lower())
+
+            profile = (await client.get(f"/garage/{user_id}")).json()["profile"]
+            assert not profile.get("cars"), profile
+            goals = " ".join(profile.get("goals", [])).lower()
+            assert "intake" in goals, profile  # goal, since there is no car
+
+            # a non-owner IS asked about buying a Mustang (the exact position
+            # in the interview is the model's call)
+            assert any("buy" in a for a in asked), asked
+
+
 @pytest.mark.asyncio
 async def test_complete_onboarding_flips_flag_and_existing_users_skip():
     user_id = str(uuid.uuid4())
