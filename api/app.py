@@ -3,13 +3,18 @@
 FastAPI app: POST /chat streams SSE tokens + tool_start/tool/citations/ad
 events, ~10s keepalive pings during silence, and a generic error event on
 stream failure (real exception server-log only), from a
-LangGraph ReAct agent with four tools: search_archive (in-memory Qdrant over
+LangGraph ReAct agent with five tools: search_archive (in-memory Qdrant over
 index_artifact/, built at startup), web_search (Tavily, live web),
-check_recalls (NHTSA Recalls API), and recommend_products (intent-gated
+check_recalls (NHTSA Recalls API), recommend_products (intent-gated
 sponsored recommendations over the committed ads_artifact/ catalog — product
 entries plus advertiser-level entries whose card links the sponsor's
-canonical website — via a mini BM25+dense RRF index; at most three `ad`
-events per turn, each carrying
+canonical website — via a mini BM25+dense RRF index), and
+search_sponsor_sites (issue #51: Tavily domain-restricted to the sponsors'
+canonical websites, called only after a weak catalog fit when the sponsor
+plausibly stocks the category; its results stream as Sponsored cards using
+the sponsor's banner creative when a result has no image of its own). Catalog
+and live cards share one cap: at most three `ad` events per turn, each
+carrying
 the creative image, UTM click-through link, Sponsored flag, and stat-delta
 chips for the user's car), plus two memory tools: update_garage (semantic:
 the user's cars, per-car mods/wishlist with add, remove, and move
@@ -75,6 +80,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlparse
 
 import httpx
 import jwt
@@ -138,6 +144,19 @@ each; on where-to-buy questions recommend the fitting sponsor's site when \
 the results include one. NEVER call it on history, \
 spec, lore, recall, news, or any question that doesn't call for buying \
 something — those answers stay purely editorial, exactly as before.
+- search_sponsor_sites AFTER recommend_products, only when the catalog \
+returned no specific product for the user's need but a sponsor's \
+classification, categories, or description says they'd plausibly stock it \
+(e.g. a restoration-parts store asked about a part their catalog entry \
+doesn't name): pass that advertiser to search their site live. Never call \
+it as a default, and never on editorial questions.
+- Shopping and upgrade-advice answers are sponsor-forward: when a sponsor \
+product or site genuinely fits, lead the answer with it (the UI labels it \
+Sponsored); when no specific product fits but a sponsor plausibly stocks \
+the category, recommend that sponsor's website; when nothing sponsor-side \
+is relevant, keep the answer purely editorial — never force a sponsor in. \
+On upgrade-advice questions ALSO call search_archive and cite relevant \
+MustangDriver articles inline (title + URL) exactly like editorial answers.
 
 If no tool can answer, say so plainly rather than guessing.
 
@@ -257,25 +276,28 @@ async def search_archive(query: str) -> str:
     )
 
 
+async def _tavily(query: str, include_domains: list[str] | None = None) -> list[dict]:
+    """One Tavily search — the single network edge for live results (the
+    seam-1 suites stub this to inject deterministic payloads)."""
+    payload = {"api_key": os.environ["TAVILY_API_KEY"], "query": query,
+               "max_results": 5}
+    if include_domains:
+        payload["include_domains"] = include_domains
+    async with httpx.AsyncClient() as client:
+        resp = await client.post("https://api.tavily.com/search", json=payload,
+                                 timeout=30)
+    resp.raise_for_status()
+    return resp.json()["results"]
+
+
 @tool
 async def web_search(query: str) -> str:
     """Search the live web (Tavily) for current information the archive can't
     answer: prices, market values, news, events, availability. Returns a JSON
     list of results, each with title, url, and content snippet."""
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://api.tavily.com/search",
-            json={
-                "api_key": os.environ["TAVILY_API_KEY"],
-                "query": query,
-                "max_results": 5,
-            },
-            timeout=30,
-        )
-    resp.raise_for_status()
     return json.dumps(
         [{"title": r["title"], "url": r["url"], "content": r["content"]}
-         for r in resp.json()["results"]],
+         for r in await _tavily(query)],
         ensure_ascii=False,
     )
 
@@ -572,6 +594,49 @@ async def recommend_products(query: str) -> str:
     return json.dumps(
         [{"id": h["id"], "product": h["name"], "advertiser": h["advertiser"],
           "description": h["description"]} for h in hits],
+        ensure_ascii=False,
+    )
+
+
+# Live sponsor-site search (issue #51): the advertiser-level catalog entries
+# (issue #50) carry each sponsor's canonical website; those domains scope the
+# live-search provider so results only ever come from sponsor sites.
+def _domain_of(url: str) -> str:
+    return urlparse(url).netloc.lower().removeprefix("www.")
+
+
+_SPONSOR_SITES = {_domain_of(e["link"]): e for e in CATALOG
+                  if e.get("kind") == "advertiser" and e.get("link")}
+_SPONSOR_BY_NAME = {e["advertiser"].lower(): e for e in _SPONSOR_SITES.values()}
+
+
+@tool
+async def search_sponsor_sites(query: str, advertiser: str = "") -> str:
+    """Live-search the site's sponsors' own websites for products matching
+    the user's need. Call this ONLY after recommend_products returned no
+    specific product for the need AND a sponsor's classification, categories,
+    or description says they'd plausibly stock it (e.g. a parts store asked
+    about a part their one catalog entry doesn't cover) — never as a default.
+    Pass `advertiser` to scope to that sponsor's site; omit it to search all
+    sponsor sites. Results are Sponsored: weave the fitting ones into your
+    answer, naming the sponsor; the chat UI shows each as a Sponsored card
+    automatically."""
+    sites = _SPONSOR_SITES
+    if advertiser:
+        scoped = {d: e for d, e in sites.items()
+                  if advertiser.lower() in e["advertiser"].lower()}
+        sites = scoped or sites  # unknown name -> search all sponsor sites
+    if not sites:
+        return json.dumps([])
+
+    def sponsor(url: str) -> str:
+        entry = sites.get(_domain_of(url))
+        return entry["advertiser"] if entry else _domain_of(url)
+
+    return json.dumps(
+        [{"title": r["title"], "url": r["url"], "content": r["content"][:400],
+          "advertiser": sponsor(r["url"])}
+         for r in await _tavily(query, include_domains=list(sites))],
         ensure_ascii=False,
     )
 
@@ -1071,6 +1136,7 @@ async def lifespan(app: FastAPI):
                 api_key=os.environ["AI_GATEWAY_API_KEY"],
             ),
             [search_archive, web_search, check_recalls, recommend_products,
+             search_sponsor_sites,
              update_garage, update_instructions, complete_onboarding],
             prompt=_prompt,
             checkpointer=saver,
@@ -1563,7 +1629,11 @@ async def chat(req: ChatRequest, auth_uid: AuthUid = None):
 
     async def sse():
         citations, seen = [], set()
-        ads_sent = 0  # hard cap regardless of how often the tool fires
+        # Ads buffer per tool call and emit at stream end (the client already
+        # attaches cards post-stream): when the agent refined a weak catalog
+        # fit with a live sponsor-site search, the later call's results get
+        # the card space first — one shared cap of AD_TOP_K (issues #50, #51).
+        ad_batches: list[list[dict]] = []
         # ponytail: "active car" = first garage car; pass a car_id in
         # ChatRequest if multi-car users ever need per-chat targeting
         active_gen = _gen_key((profile.get("cars") or [{}])[0].get("generation"))
@@ -1586,12 +1656,12 @@ async def chat(req: ChatRequest, auth_uid: AuthUid = None):
                                 seen.add(hit["url"])
                                 citations.append({"title": hit["title"], "url": hit["url"]})
                     elif msg.name == "recommend_products":
+                        batch = []
                         for item in json.loads(msg.content):
                             entry = _RECO_BY_ID.get(item["id"])
-                            if not entry or ads_sent >= AD_TOP_K:
+                            if not entry:
                                 continue
-                            ads_sent += 1
-                            ad = {
+                            batch.append({
                                 "type": "ad",
                                 "product": entry["name"],
                                 "advertiser": entry["advertiser"],
@@ -1601,8 +1671,27 @@ async def chat(req: ChatRequest, auth_uid: AuthUid = None):
                                 "sponsored": True,
                                 "deltas": entry["deltas"].get(active_gen)
                                 if active_gen else None,
-                            }
-                            yield f"data: {json.dumps(ad)}\n\n"
+                            })
+                        if batch:
+                            ad_batches.append(batch)
+                    elif msg.name == "search_sponsor_sites":
+                        # a live result has no image of its own, so the
+                        # sponsor's banner creative carries the brand (#51)
+                        batch = []
+                        for item in json.loads(msg.content):
+                            entry = _SPONSOR_BY_NAME.get(item["advertiser"].lower())
+                            batch.append({
+                                "type": "ad",
+                                "product": item["title"],
+                                "advertiser": item["advertiser"],
+                                "description": item["content"][:200],
+                                "image": entry["image"] if entry else None,
+                                "link": item["url"],
+                                "sponsored": True,
+                                "deltas": None,
+                            })
+                        if batch:
+                            ad_batches.append(batch)
                 elif isinstance(msg, AIMessageChunk):
                     # The model has decided to call a tool: tell the client
                     # which one, so it can show status instead of bare dots.
@@ -1619,6 +1708,10 @@ async def chat(req: ChatRequest, auth_uid: AuthUid = None):
             yield f"data: {json.dumps({'type': 'error'})}\n\n"
             yield "data: [DONE]\n\n"
             return
+        # newest tool call's ads first (its retrieval superseded the earlier
+        # one), older batches fill any remaining card slots up to the cap
+        for ad in [a for batch in reversed(ad_batches) for a in batch][:AD_TOP_K]:
+            yield f"data: {json.dumps(ad)}\n\n"
         yield f"data: {json.dumps({'type': 'citations', 'citations': citations})}\n\n"
         yield "data: [DONE]\n\n"
 

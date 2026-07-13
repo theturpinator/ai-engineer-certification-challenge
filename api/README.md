@@ -28,18 +28,24 @@ uv run uvicorn app:app --port 8000
   1. `data: {"type": "tool_start", "name": ...}` — emitted the moment the
      model decides to call a tool (before it runs), so clients can show
      status ("Searching the archive…") instead of bare dots
-  2. `data: {"type": "tool", "name": "search_archive" | "web_search" | "check_recalls" | "recommend_products" | "update_garage" | "update_instructions" | "complete_onboarding"}` —
+  2. `data: {"type": "tool", "name": "search_archive" | "web_search" | "check_recalls" | "recommend_products" | "search_sponsor_sites" | "update_garage" | "update_instructions" | "complete_onboarding"}` —
      one event per tool call the agent makes, when its result arrives (may
      be interleaved with tokens; zero or more)
   3. `data: {"type": "token", "text": "..."}` — one event per token as the model generates
   4. `data: {"type": "ad", "product": str, "advertiser": str, "description": str, "image": url, "link": url, "sponsored": true, "deltas": {"power": int, ...} | null}` —
-     at most three per turn, only when the agent judged the question product-intent
-     and called `recommend_products`; `deltas` carries the nine-stat change
+     at most three per turn (catalog and live sponsor-site results share the
+     cap; all ads are emitted together after generation completes, just
+     before `citations`, with the latest tool call's results taking the card
+     slots first), only when the agent judged the question product-intent and called
+     `recommend_products` or `search_sponsor_sites`; `deltas` carries the
+     nine-stat change
      (five performance + four ownership: style, comfort, safety, reliability)
-     for the user's first garage car's generation (null when no car is known).
+     for the user's first garage car's generation (null when no car is known,
+     and always null for live sponsor-site results).
      `link` is the advertiser's click-through URL with its existing UTM
      parameters (an advertiser-level entry links the sponsor's canonical
-     website instead); `image` is the hotlinked creative.
+     website; a live result links the found page); `image` is the hotlinked
+     creative (live results fall back to the sponsor's banner creative).
   5. `data: {"type": "ping"}` — keepalive whenever ~10s (`CHAT_PING_SECONDS`)
      pass with nothing else to send; clients treat any event as proof of life
      and may declare the connection dead after ~30s of total silence

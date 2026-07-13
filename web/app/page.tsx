@@ -45,6 +45,7 @@ const TOOL_STATUS: Record<string, string> = {
   web_search: "Searching the web…",
   check_recalls: "Checking recalls…",
   recommend_products: "Finding products…",
+  search_sponsor_sites: "Searching sponsor sites…",
   update_garage: "Updating your garage…",
   update_instructions: "Noting your preference…",
   complete_onboarding: "Saving your profile…",
