@@ -122,8 +122,10 @@ export default function Chat() {
   const [chatId, setChatId] = useState("");
   // First-run onboarding (issue #46): the agent interviews the user in this
   // chat; until complete_onboarding flips the server flag, all navigation
-  // away from the conversation is hidden.
-  const [onboarding, setOnboarding] = useState(false);
+  // away from the conversation is hidden. null = the /garage check is still
+  // in flight (issue #54): nav stays hidden and a spinner shows, so a cold
+  // API start never leaves the app unlocked before the interview begins.
+  const [onboarding, setOnboarding] = useState<boolean | null>(null);
   const onboardingRef = useRef(false);
   const userId = useRef<string>("");
   const sessionId = useRef<string>("");
@@ -180,12 +182,15 @@ export default function Chat() {
     apiFetch(`${API_URL}/garage/${id}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((g) => {
-        if (!g || !needsOnboarding(g)) return;
+        if (!g || !needsOnboarding(g)) {
+          setOnboarding(false); // fail open: an API outage must not brick the app
+          return;
+        }
         onboardingRef.current = true;
         setOnboarding(true);
         if (g.profile?.onboarded === undefined) send(ONBOARD_KICKOFF);
       })
-      .catch(() => {});
+      .catch(() => setOnboarding(false));
   }, []);
 
   // The server transcript is the source of truth when (re)opening a chat —
@@ -412,14 +417,15 @@ export default function Chat() {
         </div>
       )}
       <header>
-        {/* onboarding locks the site to this conversation: no drawer, no nav */}
-        {!onboarding && (
+        {/* onboarding (or the pending check) locks the site to this
+            conversation: no drawer, no nav */}
+        {onboarding === false && (
           <button type="button" className="menubtn" aria-label="Chats" onClick={openDrawer}>
             ☰
           </button>
         )}
         Ask MustangDriver
-        {!onboarding && (
+        {onboarding === false && (
           <nav>
             <AuthButton />
             <Link href="/profile">Profile</Link>
@@ -428,8 +434,13 @@ export default function Chat() {
         )}
       </header>
       <div className="messages">
+        {onboarding === null && messages.length === 0 && (
+          <div className="checking" role="status" aria-label="Loading">
+            <span className="spinner" />
+          </div>
+        )}
         {/* only after the transcript fetch lands, so history never flashes it */}
-        {!onboarding && threads[chatKey(chatId)] !== undefined && messages.length === 0 && (
+        {onboarding === false && threads[chatKey(chatId)] !== undefined && messages.length === 0 && (
           <div className="welcome">
             <p>
               Your Mustang copilot — maintenance, mods, recalls, history, and
@@ -510,7 +521,7 @@ export default function Chat() {
           placeholder={onboarding ? "Type your answer…" : "Ask about Mustangs…"}
           aria-label="Message"
         />
-        <button type="submit" disabled={busy || !input.trim()}>
+        <button type="submit" disabled={busy || !input.trim() || onboarding === null}>
           Send
         </button>
       </form>
