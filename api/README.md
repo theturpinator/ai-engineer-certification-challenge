@@ -52,7 +52,10 @@ uv run uvicorn app:app --port 8000
   6. `data: {"type": "error"}` — the stream failed server-side; the real
      exception is in the server log only. Always followed by `[DONE]`.
   7. `data: {"type": "citations", "citations": [{"title": "...", "url": "..."}]}` — the
-     articles actually retrieved this turn (empty list if no retrieval)
+     sources the answer is grounded in: archive articles when it came from
+     `search_archive`, or the live web pages when `web_search` supplied the
+     answer (an archive miss or an inherently-live question). Empty list when
+     neither grounds the turn — a recall lookup or an off-topic decline
   8. `data: [DONE]`
 
 - `GET /garage/{user_id}` →

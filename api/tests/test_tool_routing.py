@@ -1,9 +1,9 @@
 """Tool-routing smoke suite: real HTTP seam, real LLM, real tools.
 
 Asserts the agent routes recall questions to check_recalls, live-web
-questions to web_search (with a disclosure in the answer), and archive
-questions to search_archive (with citations) — observed via the `tool`
-SSE events.
+questions to web_search (with a disclosure in the answer), archive
+questions to search_archive (with citations), and off-topic questions
+to a tool-free decline (issue #55) — observed via the `tool` SSE events.
 """
 
 import json
@@ -43,6 +43,10 @@ ARCHIVE_QUESTIONS = [
     "Tell me about the 1971-1973 Mustangs",
     "Where were the first Mustangs built?",
 ]
+OFF_TOPIC_QUESTIONS = [
+    "What is the towing capacity of the 2023 Ford F-150 Lightning?",
+    "What's a good recipe for banana bread?",
+]
 
 
 @pytest.mark.asyncio
@@ -56,12 +60,15 @@ async def test_tool_routing():
                 assert len(answer) > 50
 
             for q in LIVE_QUESTIONS:
-                answer, tools, _ = await ask(client, q)
+                answer, tools, citations = await ask(client, q)
                 assert "web_search" in tools, f"{q!r} routed to {tools}"
                 lower = answer.lower()
                 assert "web search" in lower or "live web" in lower, (
                     f"{q!r} answer lacks live-web disclosure: {answer[:200]}"
                 )
+                # web-grounded answers now carry the live pages as sources
+                # instead of stale archive-fallback hits (issue #55)
+                assert citations, f"{q!r} web answer carried no sources"
 
             for q in ARCHIVE_QUESTIONS:
                 answer, tools, citations = await ask(client, q)
@@ -69,3 +76,11 @@ async def test_tool_routing():
                 assert "web_search" not in tools, f"{q!r} hit the web: {tools}"
                 assert citations, f"{q!r} returned no citations"
                 assert len(answer) > 50
+
+            for q in OFF_TOPIC_QUESTIONS:
+                answer, tools, citations = await ask(client, q)
+                assert not tools, f"{q!r} called tools: {tools}"
+                assert not citations, f"{q!r} returned citations"
+                assert "mustang" in answer.lower(), (
+                    f"{q!r} decline lacks Mustang redirect: {answer[:200]}"
+                )

@@ -2,7 +2,9 @@
 matching, generation resolution, and stock + installed = current,
 current + wishlist = dream composition with clamping. No network, no DB."""
 
-from app import BAR_STATS, _compose_bars, _gen_key, _match_entry, _sum_deltas
+from app import (
+    BAR_STATS, _car_gen_key, _compose_bars, _gen_key, _match_entry, _sum_deltas,
+)
 
 SC = {  # generic supercharger
     "id": "generic-supercharger", "name": "Supercharger",
@@ -97,6 +99,23 @@ def test_compose_no_stats_or_unknown_generation():
     bars = _compose_bars({**CAR, "generation": "spaceship",
                           "mods": ["supercharger"]}, CATALOG)
     assert bars["current"]["power"] == 80  # no gen -> deltas contribute zero
+
+
+def test_gen_key_falls_back_to_year():
+    # a blank/off-catalog generation string still resolves via the model year,
+    # so deltas (shop pills) and dream bars survive (regression: both vanished)
+    assert _car_gen_key({"year": 2016}) == "S550"
+    assert _car_gen_key({"generation": "", "year": 1990}) == "Fox-body"
+    assert _car_gen_key({"generation": "S550", "year": 1990}) == "S550"  # stored wins
+    assert _car_gen_key({"year": None}) is None
+
+
+def test_compose_dream_survives_blank_generation():
+    car = {**CAR, "generation": "", "year": 2016,
+           "mods": ["cold air intake"], "wishlist": ["supercharger"]}
+    bars = _compose_bars(car, CATALOG)
+    assert bars["current"]["power"] == 82  # 80 + 2, year -> S550
+    assert bars["dream"]["power"] == 97  # 82 + 15
 
 
 def test_compose_same_input_same_output():

@@ -118,6 +118,14 @@ TOP_K = 5
 SYSTEM_PROMPT = """You are the Ask MustangDriver assistant, an enthusiastic and \
 knowledgeable guide to the MustangDriver.com article archive.
 
+Scope: you ONLY answer questions about the Ford Mustang world — Mustangs of \
+any generation (including the Mach-E), their history, specs, builds, \
+upgrades, and parts; Mustang events, clubs, and shows; racing and race \
+tracks; and the user's own garage. For anything else (other vehicles, \
+general trivia, unrelated topics), do NOT call any tools and do NOT answer: \
+politely say in a sentence or two that you're a Mustang specialist and \
+invite a Mustang question instead.
+
 Tool policy:
 - search_archive first for Mustang history, specs, builds, reviews, and lore. \
 Ground those answers in the retrieved articles and cite sources inline as \
@@ -658,6 +666,15 @@ def _gen_key(generation) -> str | None:
     return _GEN_KEYS.get(re.sub(r"[^a-z0-9]", "", str(generation or "").lower()))
 
 
+def _car_gen_key(car: dict) -> str | None:
+    """The car's catalog deltas key: the stored generation if it resolves,
+    else derived from the model year. Without the year fallback a car with a
+    blank or off-catalog generation string loses every stat delta and dream
+    bar (both are keyed by this), even though the year pins the generation."""
+    return _gen_key(car.get("generation")) or _gen_key(
+        _derive_generation(car.get("year")))
+
+
 def _norm_words(text) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
 
@@ -729,7 +746,7 @@ def _compose_bars(car: dict, catalog: list[dict] | None = None) -> dict | None:
     stats = car.get("stats")
     if not stats:
         return None
-    gen = _gen_key(car.get("generation"))
+    gen = _car_gen_key(car)
     installed = _sum_deltas(car.get("mods"), gen, catalog)
     wished = _sum_deltas(car.get("wishlist"), gen, catalog)
     current, dream = {}, {}
@@ -1402,7 +1419,7 @@ async def upgrade_shop(user_id: str, car_id: str, auth_uid: AuthUid = None):
     car = next((c for c in profile.get("cars", []) if c["id"] == car_id), None)
     if car is None:
         raise HTTPException(404, "car not found")
-    gen = _gen_key(car.get("generation"))
+    gen = _car_gen_key(car)
     owned = [e for e in (_match_entry(m) for m in car.get("mods") or []) if e]
     wished = [e for e in (_match_entry(w) for w in car.get("wishlist") or []) if e]
     owned_ids = {e["id"] for e in owned}
@@ -1649,7 +1666,12 @@ async def chat(req: ChatRequest, auth_uid: AuthUid = None):
     answer_parts: list[str] = []  # summarizer input, filled as tokens stream
 
     async def sse():
+        # Archive citations only stand when the answer is archive-grounded.
+        # If web_search ran this turn the answer came from the live web (an
+        # archive miss or an inherently-live question), so cite the web pages
+        # and drop the retrieved-but-unused archive hits (issue #55).
         citations, seen = [], set()
+        web_citations, web_seen, web_used = [], set(), False
         # Ads buffer per tool call and emit at stream end (the client already
         # attaches cards post-stream): when the agent refined a weak catalog
         # fit with a live sponsor-site search, the later call's results get
@@ -1657,7 +1679,7 @@ async def chat(req: ChatRequest, auth_uid: AuthUid = None):
         ad_batches: list[list[dict]] = []
         # ponytail: "active car" = first garage car; pass a car_id in
         # ChatRequest if multi-car users ever need per-chat targeting
-        active_gen = _gen_key((profile.get("cars") or [{}])[0].get("generation"))
+        active_gen = _car_gen_key((profile.get("cars") or [{}])[0])
         stream = _agent.astream(
             {"messages": [{"role": "user", "content": req.message}]},
             {"configurable": {
@@ -1676,6 +1698,12 @@ async def chat(req: ChatRequest, auth_uid: AuthUid = None):
                             if hit["url"] not in seen:
                                 seen.add(hit["url"])
                                 citations.append({"title": hit["title"], "url": hit["url"]})
+                    elif msg.name == "web_search":
+                        web_used = True
+                        for r in json.loads(msg.content):
+                            if r["url"] not in web_seen:
+                                web_seen.add(r["url"])
+                                web_citations.append({"title": r["title"], "url": r["url"]})
                     elif msg.name == "recommend_products":
                         batch = []
                         for item in json.loads(msg.content):
@@ -1738,7 +1766,7 @@ async def chat(req: ChatRequest, auth_uid: AuthUid = None):
         # one), older batches fill any remaining card slots up to the cap
         for ad in [a for batch in reversed(ad_batches) for a in batch][:AD_TOP_K]:
             yield f"data: {json.dumps(ad)}\n\n"
-        yield f"data: {json.dumps({'type': 'citations', 'citations': citations})}\n\n"
+        yield f"data: {json.dumps({'type': 'citations', 'citations': web_citations if web_used else citations})}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
