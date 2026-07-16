@@ -4,8 +4,9 @@ An agentic RAG chatbot for [MustangDriver.com](https://www.mustangdriver.com) re
 
 - **Live app:** https://ask-mustangdriver-web.vercel.app (works on phone and laptop browsers)
 - **Live API:** https://ask-mustangdriver-api.vercel.app ([health](https://ask-mustangdriver-api.vercel.app/health))
-- **Demo video (Loom):** *placeholder — link added after recording*
+- **Demo video (Loom):** https://www.loom.com/share/7854c6fbd9e74617aa711e1e2c3ce05d
 - **Full product spec:** [issue #1](https://github.com/theturpinator/ai-engineer-certification-challenge/issues/1)
+- **Deliverables traceability:** [deliverables.md](deliverables.md) — maps every rubric deliverable to its exact code location
 
 This README is the written submission for the certification challenge brief.
 
@@ -210,6 +211,8 @@ For Demo Day, I plan on keeping most of the current implementation, although it 
 For Demo Day, I plan to improve the answer correctness metric versus our golden dataset. I believe the current gaps are due to differences in tone: the golden answers are pretty straight-forward and to-the-point, while the default tone of the model is more verbose and playful. I need to consult with the business users to align on an ideal tone for the agent, and align the golden answers more closely to that. Additionally, I want to look into the other RAG metrics, such as context recall and precision. I believe these can be further improved with more RAG tuning.
 
 ### Loom
+
+https://www.loom.com/share/7854c6fbd9e74617aa711e1e2c3ce05d
 
 
 ## Quick start (local development)
